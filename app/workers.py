@@ -1,4 +1,4 @@
-"""后台线程（QThread）：主线程做 DB 写入，worker 只 emit 数据。"""
+"""后台线程（QThread）：网络和耗时任务不阻塞界面。"""
 from __future__ import annotations
 
 import time
@@ -6,7 +6,7 @@ import time
 from PySide6.QtCore import QThread, Signal
 
 from .models import MailboxConfig
-from . import mailer, receiver
+from . import mailer, receiver, updater
 
 
 class TestMailboxWorker(QThread):
@@ -98,3 +98,24 @@ class FetchWorker(QThread):
                 self.progress.emit(f"{m.address} 收信失败：{exc}")
                 self.mailbox_result.emit(m.address, [])
         self.all_done.emit()
+
+
+class SyncEditorsWorker(QThread):
+    """后台同步最新编辑数据。"""
+
+    finished = Signal(bool, str, dict)   # ok, message, stats
+
+    def __init__(self, db, url: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.url = url
+
+    def run(self):
+        try:
+            result = updater.sync_from_url(self.db, self.url)
+            msg = (f"同步完成：新增 {result['inserted']} 位，"
+                   f"更新 {result['updated']} 位，本地共 {result['total']} 位"
+                   + (f"（数据版本 {result.get('version', '')}）" if result.get("version") else ""))
+            self.finished.emit(True, msg, result)
+        except Exception as exc:
+            self.finished.emit(False, f"同步失败：{exc}", {})

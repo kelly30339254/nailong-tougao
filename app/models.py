@@ -10,7 +10,9 @@ class Editor:
     name: str = ""
     platform: str = ""
     email: str = ""
-    genres: str = ""
+    genres: str = ""          # 品类：短篇/长篇/短剧…
+    directions: str = ""      # 收稿方向（题材）：世情/追妻/虐文…
+    status: str = ""          # 收稿状态：正常收稿/停止收稿/未核实
     fee_info: str = ""
     source_url: str = ""
     notes: str = ""

@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS editors (
     platform TEXT DEFAULT '',
     email TEXT DEFAULT '',
     genres TEXT DEFAULT '',
+    directions TEXT DEFAULT '',
+    status TEXT DEFAULT '',
     fee_info TEXT DEFAULT '',
     source_url TEXT DEFAULT '',
     notes TEXT DEFAULT '',
@@ -107,6 +109,12 @@ class Database:
         if "email_invalid" not in editors_cols:
             self._conn.execute(
                 "ALTER TABLE editors ADD COLUMN email_invalid INTEGER DEFAULT 0")
+        if "directions" not in editors_cols:
+            self._conn.execute(
+                "ALTER TABLE editors ADD COLUMN directions TEXT DEFAULT ''")
+        if "status" not in editors_cols:
+            self._conn.execute(
+                "ALTER TABLE editors ADD COLUMN status TEXT DEFAULT ''")
         subs_cols = {r["name"] for r in
                      self._conn.execute("PRAGMA table_info(submissions)").fetchall()}
         if "scheduled_at" not in subs_cols:
@@ -172,13 +180,15 @@ class Database:
                 seen.add(email.lower())
                 rows.append(
                     (d.get("name", ""), d.get("platform", ""), email,
-                     d.get("genres", ""), d.get("fee_info", ""), d.get("source_url", ""),
+                     d.get("genres", ""), d.get("directions", ""), d.get("status", ""),
+                     d.get("fee_info", ""), d.get("source_url", ""),
                      d.get("notes", ""), int(d.get("favorite", 0)),
                      int(d.get("blacklisted", 0)), d.get("created_at", "")))
             with self._conn:
                 self._conn.executemany(
-                    "INSERT INTO editors(name,platform,email,genres,fee_info,source_url,"
-                    "notes,favorite,blacklisted,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO editors(name,platform,email,genres,directions,status,"
+                    "fee_info,source_url,notes,favorite,blacklisted,created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     rows)
                 self._conn.execute(
                     "INSERT INTO settings(key, value) VALUES('builtin_seeded', '1')"
@@ -192,20 +202,24 @@ class Database:
 
     # ---------- editors ----------
     def list_editors(self, keyword: str | None = None, platform: str | None = None,
-                     genre: str | None = None, favorites_only: bool = False,
+                     genre: str | None = None, direction: str | None = None,
+                     favorites_only: bool = False,
                      include_blacklisted: bool = False) -> list[Editor]:
         sql = "SELECT * FROM editors WHERE 1=1"
         args: list = []
         if keyword:
-            sql += " AND (name LIKE ? OR email LIKE ? OR genres LIKE ?)"
+            sql += " AND (name LIKE ? OR email LIKE ? OR genres LIKE ? OR directions LIKE ?)"
             like = f"%{keyword}%"
-            args += [like, like, like]
+            args += [like, like, like, like]
         if platform:
             sql += " AND platform = ?"
             args.append(platform)
         if genre:
             sql += " AND genres LIKE ?"
             args.append(f"%{genre}%")
+        if direction:
+            sql += " AND directions LIKE ?"
+            args.append(f"%{direction}%")
         if favorites_only:
             sql += " AND favorite = 1"
         if not include_blacklisted:
@@ -220,6 +234,8 @@ class Database:
         return Editor(id=r["id"], name=r["name"], platform=r["platform"],
                       email=r["email"], genres=r["genres"], fee_info=r["fee_info"],
                       source_url=r["source_url"], notes=r["notes"],
+                      directions=r["directions"] if "directions" in r.keys() else "",
+                      status=r["status"] if "status" in r.keys() else "",
                       favorite=bool(r["favorite"]), blacklisted=bool(r["blacklisted"]),
                       email_invalid=bool(r["email_invalid"]),
                       created_at=r["created_at"])
@@ -232,19 +248,21 @@ class Database:
     def insert_editor(self, e: Editor) -> int:
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "INSERT INTO editors(name,platform,email,genres,fee_info,source_url,notes,favorite,blacklisted,created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (e.name, e.platform, e.email, e.genres, e.fee_info, e.source_url,
-                 e.notes, int(e.favorite), int(e.blacklisted), e.created_at or _now()))
+                "INSERT INTO editors(name,platform,email,genres,directions,status,fee_info,source_url,notes,favorite,blacklisted,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (e.name, e.platform, e.email, e.genres, e.directions, e.status,
+                 e.fee_info, e.source_url, e.notes, int(e.favorite),
+                 int(e.blacklisted), e.created_at or _now()))
             return cur.lastrowid
 
     def update_editor(self, e: Editor):
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE editors SET name=?,platform=?,email=?,genres=?,fee_info=?,source_url=?,"
-                "notes=?,favorite=?,blacklisted=? WHERE id=?",
-                (e.name, e.platform, e.email, e.genres, e.fee_info, e.source_url,
-                 e.notes, int(e.favorite), int(e.blacklisted), e.id))
+                "UPDATE editors SET name=?,platform=?,email=?,genres=?,directions=?,status=?,"
+                "fee_info=?,source_url=?,notes=?,favorite=?,blacklisted=? WHERE id=?",
+                (e.name, e.platform, e.email, e.genres, e.directions, e.status,
+                 e.fee_info, e.source_url, e.notes, int(e.favorite),
+                 int(e.blacklisted), e.id))
 
     def delete_editor(self, editor_id: int):
         with self._lock, self._conn:
@@ -276,6 +294,20 @@ class Database:
         seen = set()
         for r in rows:
             for part in r["genres"].replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
+                part = part.strip()
+                if part and part not in seen:
+                    seen.add(part)
+                    result.append(part)
+        return sorted(result)
+
+    def distinct_directions(self) -> list[str]:
+        """收稿方向（directions）拆分去重，与 genres 相同的分隔约定。"""
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT directions FROM editors WHERE directions != ''").fetchall()
+        result: list[str] = []
+        seen = set()
+        for r in rows:
+            for part in r["directions"].replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
                 part = part.strip()
                 if part and part not in seen:
                     seen.add(part)
@@ -436,6 +468,50 @@ class Database:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE editors SET email_invalid=0 WHERE id=?", (editor_id,))
+
+    # ---------- 云端同步 ----------
+    def sync_editors(self, items: list[dict]) -> dict:
+        """将云端编辑数据合并到本地。
+
+        合并策略（幂等，可重复执行）：
+        - 按 email 匹配：已存在则更新 directions/status/genres/fee_info/notes；
+          不存在则新增。已收藏/小黑屋/退信标记保留。
+        返回 {"inserted": n, "updated": m, "total": 本地总数}
+        """
+        inserted = updated = 0
+        with self._lock, self._conn:
+            existing = {r["email"].lower(): r["id"]
+                        for r in self._conn.execute(
+                            "SELECT id, email FROM editors WHERE email != ''").fetchall()}
+            for d in items:
+                email = (d.get("email") or "").strip()
+                if not email:
+                    continue
+                key = email.lower()
+                if key in existing:
+                    eid = existing[key]
+                    self._conn.execute(
+                        "UPDATE editors SET name=?,platform=?,genres=?,directions=?,"
+                        "status=?,fee_info=?,notes=?,source_url=? WHERE id=?",
+                        (d.get("name", ""), d.get("platform", ""),
+                         d.get("genres", ""), d.get("directions", ""),
+                         d.get("status", ""), d.get("fee_info", ""),
+                         d.get("notes", ""), d.get("source_url", ""), eid))
+                    updated += 1
+                else:
+                    self._conn.execute(
+                        "INSERT INTO editors(name,platform,email,genres,directions,status,"
+                        "fee_info,source_url,notes,blacklisted,created_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (d.get("name", ""), d.get("platform", ""), email,
+                         d.get("genres", ""), d.get("directions", ""),
+                         d.get("status", ""), d.get("fee_info", ""),
+                         d.get("source_url", ""), d.get("notes", ""),
+                         int(d.get("status") == "停止收稿"), _now()))
+                    existing[key] = -1  # 防止重复 key 重复插入
+                    inserted += 1
+        return {"inserted": inserted, "updated": updated,
+                "total": self.counts()["编辑总数"]}
 
     # ---------- 催稿提醒 ----------
     def stale_submissions(self, days: int) -> list[Submission]:
