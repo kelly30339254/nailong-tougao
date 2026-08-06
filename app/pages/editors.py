@@ -7,7 +7,7 @@ import os
 import re
 
 from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QColor
+from PySide6.QtGui import QDesktopServices, QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QFrame,
@@ -23,6 +23,8 @@ from .. import updater
 from ..workers import SyncEditorsWorker
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DIRECTIONS_PREVIEW_LENGTH = 5
+DIRECTIONS_COLUMN_WIDTH = 104
 
 CSV_HEADERS = ["名称", "平台", "邮箱", "题材", "收稿方向", "状态", "稿费", "来源", "备注"]
 _HEADER_ALIASES = {
@@ -141,6 +143,10 @@ class EditorsPage(QWidget):
         self.fav_check = QCheckBox("只看收藏")
         self.fav_check.toggled.connect(self._reload_table)
         toolbar.addWidget(self.fav_check)
+        self.accepting_check = QCheckBox("只看正在收稿")
+        self.accepting_check.setToolTip("仅显示状态为“正常收稿”的编辑")
+        self.accepting_check.toggled.connect(self._reload_table)
+        toolbar.addWidget(self.accepting_check)
         toolbar.addStretch(1)
 
         self.sync_btn = QPushButton("同步最新编辑")
@@ -181,13 +187,18 @@ class EditorsPage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
+        # 普通文本列的宽度在填充数据后一次性测量并固定；窗口不够时由
+        # 横向滚动条承载，避免 Qt 的 ResizeToContents 在数千行数据上反复扫描。
+        for col in (1, 2, 3, 4, 7):
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 52)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        self.table.setColumnWidth(5, DIRECTIONS_COLUMN_WIDTH)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
         self.table.setColumnWidth(6, 90)
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        self.table.setColumnWidth(8, 64)
         header.setSectionResizeMode(9, QHeaderView.Fixed)
         self.table.setColumnWidth(9, 64)
         header.setSectionResizeMode(10, QHeaderView.Fixed)
@@ -206,9 +217,12 @@ class EditorsPage(QWidget):
         genre = None if genre in ("", "全部题材") else genre
         direction = self.direction_combo.currentText()
         direction = None if direction in ("", "全部方向") else direction
-        return self.db.list_editors(keyword=keyword, platform=platform, genre=genre,
-                                    direction=direction,
-                                    favorites_only=self.fav_check.isChecked())
+        editors = self.db.list_editors(
+            keyword=keyword, platform=platform, genre=genre, direction=direction,
+            favorites_only=self.fav_check.isChecked())
+        if self.accepting_check.isChecked():
+            editors = [e for e in editors if (e.status or "").strip() == "正常收稿"]
+        return editors
 
     def refresh(self):
         total = self.db.counts()["编辑总数"]
@@ -269,14 +283,19 @@ class EditorsPage(QWidget):
             fav_btn.clicked.connect(lambda _=False, eid=e.id: self._toggle_fav(eid))
             self.table.setCellWidget(row, 0, self._center(fav_btn))
 
+            directions = e.directions or ""
+            directions_preview = directions[:DIRECTIONS_PREVIEW_LENGTH]
+            if len(directions) > DIRECTIONS_PREVIEW_LENGTH:
+                directions_preview += "…"
             for col, text in ((1, e.name), (2, e.platform), (3, e.email),
-                              (4, e.genres), (5, e.directions), (7, e.fee_info)):
+                              (4, e.genres), (5, directions_preview),
+                              (7, e.fee_info)):
                 item = mk_item(text or "")
                 if col == 3 and e.email_invalid:
                     item.setForeground(Qt.red)
                     item.setToolTip("该邮箱投递被退回，已自动跳过")
-                if col == 5 and e.directions:
-                    item.setToolTip(f"收稿方向：{e.directions}")
+                if col == 5 and directions:
+                    item.setToolTip(f"收稿方向：{directions}")
                 self.table.setItem(row, col, item)
 
             # 收稿状态
@@ -331,6 +350,25 @@ class EditorsPage(QWidget):
             del_btn.clicked.connect(lambda _=False, ed=e: self._on_delete(ed))
             ops_layout.addWidget(del_btn)
             self.table.setCellWidget(row, 10, ops)
+
+        self._fit_text_columns(editors)
+
+    def _fit_text_columns(self, editors: list[Editor]):
+        """按完整文本一次性计算列宽，兼顾不截字和大数据量性能。"""
+        metrics = QFontMetrics(self.table.font())
+        values = {
+            1: (e.name or "" for e in editors),
+            2: (e.platform or "" for e in editors),
+            3: (e.email or "" for e in editors),
+            4: (e.genres or "" for e in editors),
+            7: (e.fee_info or "" for e in editors),
+        }
+        for col, texts in values.items():
+            header_text = self.table.horizontalHeaderItem(col).text()
+            text_width = max(
+                [metrics.horizontalAdvance(header_text),
+                 *(metrics.horizontalAdvance(text) for text in texts)])
+            self.table.setColumnWidth(col, text_width + 28)
 
     @staticmethod
     def _center(widget: QWidget) -> QWidget:

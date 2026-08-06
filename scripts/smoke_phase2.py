@@ -53,12 +53,30 @@ check("三页真实类型", isinstance(editors_page, EditorsPage)
       and type(editors_page).__name__ == "EditorsPage")
 
 eid = db.insert_editor(Editor(name="张三编辑", platform="平台A", email="ed1@x.com",
-                              genres="言情/悬疑", fee_info="千字100",
+                              genres="言情/悬疑", directions="甜宠玄学年代古言",
+                              status="正常收稿", fee_info="千字100",
                               source_url="https://example.com/1", notes="备注"))
 db.insert_editor(Editor(name="李四编辑", platform="平台B", email="ed2@x.com",
-                        genres="科幻", favorite=True))
+                        genres="科幻", directions="科幻悬疑推理",
+                        status="停止收稿", favorite=True))
 editors_page.refresh()
 check("编辑表格行数", editors_page.table.rowCount() == 2)
+check("收稿方向只显示前 5 字并保留悬停详情",
+      editors_page.table.item(1, 5).text() == "甜宠玄学年…"
+      and editors_page.table.item(1, 5).toolTip() == "收稿方向：甜宠玄学年代古言")
+
+from PySide6.QtWidgets import QHeaderView
+editor_header = editors_page.table.horizontalHeader()
+check("普通文本列完整自适应且收稿方向固定窄列",
+      all(editor_header.sectionResizeMode(col) == QHeaderView.Fixed
+          for col in (1, 2, 3, 4, 7))
+      and editor_header.sectionResizeMode(5) == QHeaderView.Fixed
+      and editors_page.table.columnWidth(5) <= 110
+      and all(editors_page.table.columnWidth(col)
+              >= editors_page.table.fontMetrics().horizontalAdvance(
+                  editors_page.table.item(row, col).text()) + 28
+              for row in range(editors_page.table.rowCount())
+              for col in (1, 2, 3, 4, 7)))
 
 # 搜索过滤
 editors_page.search_edit.setText("张三")
@@ -70,6 +88,11 @@ editors_page.fav_check.setChecked(True)
 check("只看收藏", editors_page.table.rowCount() == 1
       and editors_page.table.item(0, 1).text() == "李四编辑")
 editors_page.fav_check.setChecked(False)
+# 只看正在收稿（“未核实”和“停止收稿”均不计入）
+editors_page.accepting_check.setChecked(True)
+check("只看正在收稿", editors_page.table.rowCount() == 1
+      and editors_page.table.item(0, 1).text() == "张三编辑")
+editors_page.accepting_check.setChecked(False)
 # 平台筛选
 editors_page.platform_combo.setCurrentText("平台A")
 check("平台筛选", editors_page.table.rowCount() == 1)

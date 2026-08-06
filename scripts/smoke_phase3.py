@@ -265,8 +265,8 @@ check("操作列固定宽不被截断",
       and records_page.table.columnWidth(7) >= 80
       and replies_page.table.horizontalHeader().sectionResizeMode(6) == QHeaderView.Fixed
       and replies_page.table.columnWidth(6) >= 170
-      and win._pages["editors"].table.horizontalHeader().sectionResizeMode(8) == QHeaderView.Fixed
-      and win._pages["editors"].table.columnWidth(8) >= 200
+      and win._pages["editors"].table.horizontalHeader().sectionResizeMode(10) == QHeaderView.Fixed
+      and win._pages["editors"].table.columnWidth(10) >= 200
       and win._pages["manuscripts"].table.horizontalHeader().sectionResizeMode(9) == QHeaderView.Fixed
       and win._pages["manuscripts"].table.columnWidth(9) >= 170)
 check("表格最后一列不被拉伸挤压",
