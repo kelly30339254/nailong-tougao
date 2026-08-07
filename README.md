@@ -41,9 +41,20 @@ QT_QPA_PLATFORM=offscreen NAILONG_SMOKE=1 .venv/Scripts/python.exe main.py   # �
 
 ## 系统要求与多平台打包
 
-- **Windows 10 / 11**（不支持 Win7：Qt6 与 Python 3.9+ 均已放弃 Win7）
+- **Windows 10 / 11 64 位**（不支持 Win7：Qt6 与 Python 3.9+ 均已放弃 Win7）
 - **macOS 11+**：CI 产物为 `奶龙投稿助手.app`（zip 压缩）。未做苹果签名，首次打开请「右键 → 打开」，或在终端执行 `xattr -dr com.apple.quarantine 奶龙投稿助手.app`
 - **Linux**（主流发行版）：CI 产物为单文件可执行程序（tar.gz）。若运行报缺库，安装 Qt 运行依赖，如 Debian/Ubuntu：`sudo apt install libegl1 libxkbcommon0 libxcb-cursor0`
+
+### Windows 打开时报错「DLL load failed / QtWidgets / 找不到指定的模块」
+
+这是 PySide6（Qt）依赖的系统运行库缺失或 exe 打包异常，按顺序处理：
+
+1. **安装 Visual C++ 运行库（最常见）**  
+   下载并安装 **Microsoft Visual C++ 2015–2022 可再发行组件包 (x64)**：  
+   https://aka.ms/vs/17/release/vc_redist.x64.exe  
+   装完后重启电脑，再双击 exe。
+2. 确认是 **64 位 Windows 10/11**，不要把程序放进仅同步的网盘目录（可先复制到桌面再试）。
+3. 若仍失败：用本仓库重新打包的 exe（已关闭 UPX 压缩，避免压坏 Qt DLL），或从最新 Release / Actions 产物下载。
 
 macOS / Linux 安装包由 GitHub Actions 自动构建（PyInstaller 不支持跨平台编译）：推送到 main 即触发三平台构建，产物在 Actions 页面下载；打 `v*` 标签会自动创建 Release 并附三平台安装包。
 

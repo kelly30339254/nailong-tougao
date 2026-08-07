@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Qt6 / PySide6：务必关闭 UPX，否则 Windows 上易出现
+# 「DLL load failed while importing QtWidgets: 找不到指定的模块」
 import sys
 
 
@@ -27,7 +29,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

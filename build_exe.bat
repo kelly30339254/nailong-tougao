@@ -9,12 +9,8 @@ if not exist %PYI% (
     exit /b 1
 )
 
-%PYI% --noconfirm --clean --noconsole --onefile ^
-    --name "奶龙投稿助手" ^
-    --add-data "app/style.qss;app" ^
-    --add-data "app/assets;app/assets" ^
-    --add-data "app/data;app/data" ^
-    main.py
+rem 统一走 .spec（已关闭 UPX，避免 Win10 上 QtWidgets DLL 加载失败）
+%PYI% --noconfirm --clean "奶龙投稿助手.spec"
 
 if errorlevel 1 (
     echo [错误] 打包失败，请检查上方输出
