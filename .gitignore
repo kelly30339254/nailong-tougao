@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .testdata/
 debug.spec
+# 卡密文件（未核销的卡密属于敏感数据，不入库）
+cardkeys-*.json

@@ -78,7 +78,7 @@ manuscripts_page = win._pages["manuscripts"]
 dashboard_page = win._pages["dashboard"]
 
 # ---------- 对话框校验 ----------
-from app.pages.sales import SaleDialog, MONTH_RE
+from app.pages.sales import SaleDialog
 
 dlg = SaleDialog(db, sales_page)
 dlg.amount_edit.setText("八百块")
@@ -86,17 +86,17 @@ dlg._on_save()
 check("金额非数字拒绝", any("数字" in w for w in warnings) and dlg.result() != QDialog.Accepted)
 warnings.clear()
 dlg.amount_edit.setText("800")
-dlg.month_edit.setText("2026年9月")
+dlg.payment_date_edit.setText("2026年9月")
 dlg._on_save()
-check("月份格式拒绝", any("yyyy-MM" in w for w in warnings) and dlg.result() != QDialog.Accepted)
+check("日期格式拒绝", any("yyyy-MM-dd" in w for w in warnings) and dlg.result() != QDialog.Accepted)
 warnings.clear()
-dlg.month_edit.setText("2026-09")
+dlg.payment_date_edit.setText("2026-09-15")
 dlg._on_save()
 check("合法表单通过", dlg.result() == QDialog.Accepted
       and dlg.sale.manuscript_id in (m1, m2)
-      and dlg.sale.amount == 800.0 and dlg.sale.payment_month == "2026-09")
-check("月份正则", MONTH_RE.match("2026-09") and not MONTH_RE.match("2026-9")
-      and not MONTH_RE.match("26-09"))
+      and dlg.sale.amount == 800.0 and dlg.sale.payment_date == "2026-09-15"
+      and dlg.sale.payment_month == "")
+check("完整打款日期", dlg.sale.payment_date == "2026-09-15")
 # 空库文稿下拉
 db_empty = Database(db_path=os.path.join(tempfile.mkdtemp(prefix="nailong_es_"), "e.db"))
 dlg2 = SaleDialog(db_empty, sales_page)

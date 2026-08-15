@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QFrame, QDialog, QMessageBox,
+    QTableWidget, QTableWidgetItem, QFrame, QDialog, QMessageBox, QInputDialog,
     QAbstractItemView, QHeaderView, QPlainTextEdit,
 )
 
@@ -151,11 +151,32 @@ class RepliesPage(QWidget):
                 read_btn.setObjectName("iconBtn")
                 read_btn.clicked.connect(lambda _=False, rid=r.id: self._on_mark_read(rid))
                 ops_layout.addWidget(read_btn)
+            if r.verdict == "待确认":
+                confirm_btn = QPushButton("确认判定")
+                confirm_btn.setObjectName("iconBtn")
+                confirm_btn.clicked.connect(lambda _=False, rep=r: self._on_confirm(rep))
+                ops_layout.addWidget(confirm_btn)
             view_btn = QPushButton("查看全文")
             view_btn.setObjectName("iconBtn")
             view_btn.clicked.connect(lambda _=False, rep=r: self._on_view(rep))
             ops_layout.addWidget(view_btn)
             self.table.setCellWidget(row, 6, ops)
+
+    def _on_confirm(self, reply):
+        verdict, ok = QInputDialog.getItem(
+            self, "确认回信判定", "请选择实际结果：",
+            ["过稿", "退稿", "需修改", "其他"], 0, False)
+        if not ok:
+            return
+        if not self.db.confirm_reply_verdict(reply.id, verdict):
+            QMessageBox.warning(self, "提示", "该回信已不存在，请刷新后重试。")
+            return
+        self.main_window.data_changed.emit()
+        self._reload()
+        if reply.submission_id is None and verdict != "其他":
+            QMessageBox.information(
+                self, "已保存判定",
+                "该回信无法唯一关联到某次投稿，因此只更新了回信判定，未修改投稿状态。")
 
     def _on_mark_read(self, reply_id: int):
         self.db.mark_read(reply_id)
@@ -182,14 +203,19 @@ class RepliesPage(QWidget):
         _auto, _interval, lookback_days = self.store.get_fetch_config()
         self._new_count = 0
         self._invalid_count = 0
+        self._fetch_failures: list[tuple[str, str]] = []
         self.fetch_btn.setEnabled(False)
         self.fetch_btn.setText("收信中…")
         self.status_label.setText("")
         self._fetch_worker = FetchWorker(mailboxes, editor_emails, lookback_days, self)
         self._fetch_worker.progress.connect(lambda msg: self.status_label.setText(msg))
         self._fetch_worker.mailbox_result.connect(self._on_mailbox_result)
+        self._fetch_worker.mailbox_failed.connect(self._on_mailbox_failed)
         self._fetch_worker.all_done.connect(self._on_fetch_done)
         self._fetch_worker.start()
+
+    def _on_mailbox_failed(self, address: str, error: str):
+        self._fetch_failures.append((address, error))
 
     def _on_mailbox_result(self, address: str, results: list):
         res = ingest_results(self.db, address, results)
@@ -203,6 +229,10 @@ class RepliesPage(QWidget):
         text = f"本次新到 {self._new_count} 封"
         if self._invalid_count:
             text += f"，标记失效邮箱 {self._invalid_count} 个"
+        failures = getattr(self, "_fetch_failures", [])
+        if failures:
+            addresses = "、".join(address for address, _error in failures)
+            text += f"；{len(failures)} 个邮箱收信失败：{addresses}"
         self.status_label.setText(text)
         self.main_window.data_changed.emit()
         self._reload()

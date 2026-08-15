@@ -6,17 +6,24 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QComboBox, QListWidget, QListWidgetItem, QStackedWidget, QFrame,
+    QMessageBox,
 )
 
+from . import APP_VERSION
 from .theme import THEMES, DEFAULT_THEME, apply_theme
 from .settings_store import SettingsStore
+from .tutorial import TutorialDialog
+
+TUTORIAL_ACTION = "local:tutorial"
 
 LINKS = [
-    ("智语写作", "AI 辅助写作平台", "AI 辅助写作平台，点击前往",
+    ("智语写作", "AI辅助写作·短篇收稿风向", "AI辅助写作与短篇收稿风向，点击前往",
      "https://zhiyuxiezuo.com/login?invited=HKMLyO"),
-    ("奶龙数据站", "网文风向大数据 · 内含 2000+ 投稿邮箱",
-     "网文风向大数据网站，内含两千多个投稿邮箱，点击前往",
+    ("奶龙数据站", "长篇网文风向·实用创作工具",
+     "长篇网文风向与实用创作工具，点击前往",
      "https://nailong.zhiyuxiezuo.com/"),
+    ("使用教程", "功能列表·文字操作指南", "查看奶龙投稿助手功能列表和文字使用教程",
+     TUTORIAL_ACTION),
 ]
 
 # 拍平的 7 个导航项（无分组标题）
@@ -33,14 +40,16 @@ NAV_ITEMS = [
 
 
 class PromoButton(QFrame):
-    """顶栏宣传按钮：主色实底、双行文字（标题 + 小字说明），点击打开链接。"""
+    """顶栏双行按钮：可打开外部链接或执行本地操作。"""
 
-    def __init__(self, title: str, subtitle: str, tooltip: str, url: str, parent=None):
+    def __init__(self, title: str, subtitle: str, tooltip: str, url: str,
+                 on_click=None, parent=None):
         super().__init__(parent)
         self.setObjectName("promoBtn")
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(tooltip)
         self._url = url
+        self._on_click = on_click
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 6, 16, 6)
         layout.setSpacing(0)
@@ -56,7 +65,10 @@ class PromoButton(QFrame):
         layout.addWidget(sub_label)
 
     def mousePressEvent(self, _event):
-        QDesktopServices.openUrl(QUrl(self._url))
+        if self._on_click is not None:
+            self._on_click()
+        elif self._url:
+            QDesktopServices.openUrl(QUrl(self._url))
 
 
 class PlaceholderPage(QWidget):
@@ -130,6 +142,10 @@ class MainWindow(QMainWindow):
         self._sched_timer.timeout.connect(self._check_scheduled)
         self._sched_timer.start(30 * 1000)
 
+        # 启动 5 秒后后台检查新版本（静默，失败不打扰）
+        self._update_worker = None
+        QTimer.singleShot(5000, self.check_update)
+
     # ---------- 顶栏 ----------
     def _build_topbar(self) -> QWidget:
         bar = QWidget()
@@ -145,7 +161,8 @@ class MainWindow(QMainWindow):
         layout.addSpacing(16)
 
         for name, subtitle, tooltip, url in LINKS:
-            promo = PromoButton(name, subtitle, tooltip, url, bar)
+            on_click = self._show_tutorial if url == TUTORIAL_ACTION else None
+            promo = PromoButton(name, subtitle, tooltip, url, on_click, bar)
             promo.setFixedHeight(40)
             layout.addWidget(promo, 0, Qt.AlignVCenter)
 
@@ -169,6 +186,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.theme_combo, 0, Qt.AlignVCenter)
 
         return bar
+
+    def _create_tutorial_dialog(self) -> TutorialDialog:
+        return TutorialDialog(self)
+
+    def _show_tutorial(self):
+        self._tutorial_dialog = self._create_tutorial_dialog()
+        self._tutorial_dialog.exec()
 
     # ---------- 侧栏 ----------
     def _build_sidebar(self) -> QWidget:
@@ -278,8 +302,9 @@ class MainWindow(QMainWindow):
                     attachment = manuscript.file_path
             jobs.append({"submission_id": s.id, "to": s.to_email,
                          "subject": s.subject, "body": s.body,
+                         "message_id": s.message_id,
                          "attachment_path": attachment})
-        self._sched_worker = SendWorker(mailboxes, jobs, interval, self)
+        self._sched_worker = SendWorker(mailboxes, jobs, interval, self, db=self.db)
         self._sched_worker.item_done.connect(self._on_sched_item_done)
         self._sched_worker.all_done.connect(self._on_sched_all_done)
         self._sched_worker.start()
@@ -295,15 +320,54 @@ class MainWindow(QMainWindow):
         self._sched_worker = None
         self.data_changed.emit()
 
+    # ---------- 检查更新 ----------
+    def check_update(self, manual: bool = False):
+        """后台检查新版本。manual=True 时无更新/失败也弹提示（设置页手动触发）。"""
+        from .workers import UpdateCheckWorker
+        if self._update_worker is not None and self._update_worker.isRunning():
+            return
+        self._update_worker = UpdateCheckWorker(self)
+        self._update_worker.result.connect(
+            lambda info, error: self._on_update_result(info, error, manual))
+        self._update_worker.start()
+
+    def _on_update_result(self, info, error: str, manual: bool):
+        self._update_worker = None
+        if info is None:
+            if manual:
+                if error:
+                    QMessageBox.warning(self, "检查更新",
+                                        f"检查失败，请检查网络后重试。\n（{error}）")
+                else:
+                    QMessageBox.information(self, "检查更新",
+                                            f"当前已是最新版本（{APP_VERSION}）")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"发现新版本 {info['version']}（当前 {APP_VERSION}）")
+        if info.get("notes"):
+            box.setInformativeText(info["notes"])
+        download_btn = None
+        if info.get("download_url"):
+            download_btn = box.addButton("去下载", QMessageBox.AcceptRole)
+        box.addButton("下次再说", QMessageBox.RejectRole)
+        box.exec()
+        if download_btn is not None and box.clickedButton() is download_btn:
+            QDesktopServices.openUrl(QUrl(info["download_url"]))
+
     # ---------- 顶栏状态 ----------
     def update_mail_badge(self):
         mailboxes = self.store.load_mailboxes()
         enabled = sum(1 for m in mailboxes if m.enabled and m.address)
         if enabled:
-            self.mail_badge.setText(f"邮箱已配置 {enabled}/4")
+            self.mail_badge.setText(f"邮箱已配置 {enabled} 个")
+            self.mail_badge.setToolTip(
+                f"已启用 {enabled} 个邮箱；点击前往设置页，可按需继续添加邮箱")
             self.mail_badge.setObjectName("mailBadgeOk")
         else:
             self.mail_badge.setText("邮箱未配置")
+            self.mail_badge.setToolTip("点击前往设置页配置邮箱，可按需继续添加")
             self.mail_badge.setObjectName("mailBadgeWarn")
         # objectName 变化后需刷新样式
         self.mail_badge.style().unpolish(self.mail_badge)

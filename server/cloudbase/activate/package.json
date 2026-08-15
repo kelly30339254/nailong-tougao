@@ -1,0 +1,9 @@
+{
+  "name": "activate",
+  "version": "1.0.0",
+  "description": "奶龙投稿助手卡密激活接口",
+  "main": "index.js",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^2.9.0"
+  }
+}

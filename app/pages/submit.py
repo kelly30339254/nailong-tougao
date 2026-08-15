@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+import re
+from email.utils import make_msgid
 
 from PySide6.QtCore import Qt, QDateTime
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QComboBox, QCheckBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -12,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Submission
-from ..letter import build_letter
+from ..letter import build_letter, personalize_letter
 from ..docx_reader import read_docx_text, count_cjk_words
 from ..workers import SendWorker
 from ..widgets import mk_item
@@ -145,6 +148,10 @@ class SubmitPage(QWidget):
         self.filter_edit.setClearButtonEnabled(True)
         self.filter_edit.textChanged.connect(self._reload_editors_table)
         tool.addWidget(self.filter_edit, 1)
+        self.smart_check = QCheckBox("智选排序")
+        self.smart_check.setToolTip("按稿件标签排序并显示匹配依据，不会自动勾选编辑")
+        self.smart_check.toggled.connect(self._reload_editors_table)
+        tool.addWidget(self.smart_check)
         self.checked_label = QLabel("已选: 0 家")
         tool.addWidget(self.checked_label)
         self.select_all_check = QCheckBox("全选当前结果")
@@ -164,9 +171,10 @@ class SubmitPage(QWidget):
         info_layout.addWidget(info_text)
         box.addWidget(info)
 
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels(
-            ["", "序", "编辑名称", "平台", "邮箱", "7日已投", "历史投递", "回复", "过稿"])
+            ["", "序", "编辑名称", "平台", "邮箱", "稿件类型", "收稿方向",
+             "收稿状态", "7日已投", "历史投递", "回复", "过稿", "智选匹配"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setAlternatingRowColors(True)
@@ -175,9 +183,12 @@ class SubmitPage(QWidget):
         self.table.setMinimumHeight(260)
         self.table.itemChanged.connect(self._on_item_changed)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
-        for col in (0, 1, 5, 6, 7, 8):
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        for col in (0, 1, 2, 3, 5, 7, 8, 9, 10, 11):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        for col in (4, 6, 12):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+        header.setMinimumSectionSize(50)
         header.setStretchLastSection(False)
         box.addWidget(self.table, 1)
 
@@ -241,6 +252,41 @@ class SubmitPage(QWidget):
             editors = self.db.list_editors()
         return [e for e in editors if not e.email_invalid]
 
+    @staticmethod
+    def _match_tokens(value: str) -> list[str]:
+        return [token.strip().lower() for token in re.split(r"[、,，/|\s]+", value or "")
+                if len(token.strip()) >= 2]
+
+    def _editor_match(self, editor) -> tuple[int, str]:
+        manuscript = None
+        manuscript_id = self._current_manuscript_id()
+        if manuscript_id:
+            manuscript = self.db.get_manuscript(manuscript_id)
+        fields = (
+            ((manuscript.category if manuscript else self.category_combo.currentText()), 5, "题材"),
+            ((manuscript.genre_type if manuscript else self.genre_edit.text()), 4, "篇幅"),
+            ((manuscript.reader_group if manuscript else self.reader_combo.currentText()), 2, "读者群"),
+            ((manuscript.emotion if manuscript else self.emotion_combo.currentText()), 2, "情绪"),
+            ((manuscript.style if manuscript else self.style_combo.currentText()), 2, "风格"),
+        )
+        haystack = f"{editor.genres or ''} {editor.directions or ''}".lower()
+        score = 0
+        reasons: list[str] = []
+        has_tags = False
+        for value, weight, label in fields:
+            tokens = self._match_tokens(value)
+            has_tags = has_tags or bool(tokens)
+            matched = [token for token in tokens if token in haystack]
+            matched = list(dict.fromkeys(matched))
+            if matched:
+                score += weight
+                reasons.append(f"{label}：{'、'.join(matched)}")
+        if not has_tags:
+            return 0, "稿件标签不足"
+        if not reasons:
+            return 0, "暂无明确匹配"
+        return score, "；".join(reasons)
+
     def _reload_editors_table(self):
         keyword = self.filter_edit.text().strip().lower()
         editors = self._tab_editors()
@@ -248,7 +294,14 @@ class SubmitPage(QWidget):
             editors = [e for e in editors if keyword in (e.name or "").lower()
                        or keyword in (e.email or "").lower()
                        or keyword in (e.platform or "").lower()
-                       or keyword in (e.genres or "").lower()]
+                       or keyword in (e.genres or "").lower()
+                       or keyword in (e.directions or "").lower()
+                       or keyword in (e.status or "").lower()]
+        match_info = {editor.id: self._editor_match(editor) for editor in editors}
+        if self.smart_check.isChecked():
+            editors = [editor for editor in editors
+                       if (editor.status or "").strip() != "停止收稿"]
+            editors.sort(key=lambda editor: (-match_info[editor.id][0], editor.name or ""))
         self._current_editors = editors
 
         # 每个编辑的投递统计（一次取全量，内存聚合）
@@ -269,7 +322,7 @@ class SubmitPage(QWidget):
             item.setTextAlignment(Qt.AlignCenter)
             item.setForeground(Qt.gray)
             self.table.setItem(0, 0, item)
-            self.table.setSpan(0, 0, 1, 9)
+            self.table.setSpan(0, 0, 1, 13)
             self.table.blockSignals(False)
             self._update_checked_label()
             return
@@ -286,10 +339,38 @@ class SubmitPage(QWidget):
             self.table.setItem(row, 1, seq)
             for col, text in ((2, e.name), (3, e.platform), (4, e.email)):
                 self.table.setItem(row, col, mk_item(text or ""))
+
+            genres = (e.genres or "").strip() or "未标注"
+            directions = (e.directions or "").strip() or "未标注"
+            status = (e.status or "").strip() or "未核实"
+            genres_item = mk_item(genres)
+            genres_item.setToolTip(f"稿件类型：{genres}")
+            self.table.setItem(row, 5, genres_item)
+            directions_preview = directions if len(directions) <= 24 else directions[:24] + "…"
+            directions_item = mk_item(directions_preview)
+            directions_item.setToolTip(f"收稿方向：{directions}")
+            self.table.setItem(row, 6, directions_item)
+            status_item = mk_item(status, Qt.AlignCenter)
+            if status == "停止收稿":
+                status_item.setForeground(Qt.red)
+            elif status == "正常收稿":
+                status_item.setForeground(QColor("#2F9E44"))
+            else:
+                status_item.setForeground(QColor("#D97706"))
+            status_item.setToolTip(f"收稿状态：{status}")
+            self.table.setItem(row, 7, status_item)
+
             st = stats.get(e.id, {"total": 0, "replied": 0, "passed": 0})
             last7 = self.db.count_editor_last_days(e.id, 7)
-            for col, num in ((5, last7), (6, st["total"]), (7, st["replied"]), (8, st["passed"])):
+            for col, num in ((8, last7), (9, st["total"]), (10, st["replied"]), (11, st["passed"])):
                 self.table.setItem(row, col, mk_item(str(num), Qt.AlignCenter))
+            score, reason = match_info[e.id]
+            match_text = f"{score}分 · {reason}" if self.smart_check.isChecked() else "开启智选查看"
+            match_item = mk_item(match_text)
+            match_item.setToolTip(
+                f"匹配结果：{reason}\n稿件类型：{genres}\n"
+                f"收稿方向：{directions}\n收稿状态：{status}")
+            self.table.setItem(row, 12, match_item)
         self.table.blockSignals(False)
         self._update_checked_label()
 
@@ -341,6 +422,7 @@ class SubmitPage(QWidget):
             self._temp_file_path = path
             self.title_edit.setText(os.path.splitext(os.path.basename(path))[0])
             self.words_edit.setText(str(count_cjk_words(text)))
+            self._reload_editors_table()
             return
         manuscript = self.db.get_manuscript(data)
         if manuscript is None:
@@ -356,6 +438,7 @@ class SubmitPage(QWidget):
         if manuscript.style in STYLES:
             self.style_combo.setCurrentText(manuscript.style)
         self.genre_edit.setText(manuscript.genre_type or "")
+        self._reload_editors_table()
 
     def _current_manuscript_id(self) -> int | None:
         data = self.manuscript_combo.currentData()
@@ -381,7 +464,7 @@ class SubmitPage(QWidget):
             if ret != QMessageBox.Yes:
                 return
         subject_tpl, body_tpl = self.store.get_letter_template()
-        subject, body = build_letter(title, words, category, "老师",
+        subject, body = build_letter(title, words, category, "{编辑称呼}",
                                      subject_tpl, body_tpl)
         self.subject_edit.setText(subject)
         self.body_edit.setPlainText(body)
@@ -411,12 +494,12 @@ class SubmitPage(QWidget):
         return True
 
     def _build_jobs(self, status: str, scheduled_at: str = "") -> tuple[list, int]:
-        """逐勾选编辑构建 job（一稿一投/同平台/小黑屋/失效跳过），返回 (jobs, skipped)。"""
+        """逐编辑原子建任务，并保存该编辑实际收到的个性化内容。"""
         one_draft, _interval, _daily = self.store.get_strategy()
         manuscript_id = self._current_manuscript_id()
         attachment = self._current_attachment() or None
-        subject = self.subject_edit.text().strip()
-        body = self.body_edit.toPlainText().strip()
+        base_subject = self.subject_edit.text().strip()
+        base_body = self.body_edit.toPlainText().strip()
 
         editors_by_id = {e.id: e for e in self.db.list_editors(include_blacklisted=True)}
         jobs: list[dict] = []
@@ -426,23 +509,29 @@ class SubmitPage(QWidget):
             editor = editors_by_id.get(editor_id)
             if editor is None or editor.blacklisted or editor.email_invalid:
                 continue
-            if one_draft and manuscript_id and self.db.find_pending(manuscript_id, editor.id):
-                self._log(f"跳过（未回复）：{editor.name}")
-                skipped += 1
-                continue
             platform = (editor.platform or "").strip()
             if platform and platform in seen_platforms:
                 self._log(f"跳过（同平台重复）：{editor.name}")
                 skipped += 1
                 continue
-            if platform:
-                seen_platforms.add(platform)
-            sid = self.db.insert_submission(Submission(
+            subject, body = personalize_letter(
+                base_subject, base_body, editor.name or "编辑老师")
+            message_id = make_msgid(domain="nailong.local")
+            submission = Submission(
                 manuscript_id=manuscript_id, editor_id=editor.id,
                 to_email=editor.email, subject=subject, body=body,
-                status=status, scheduled_at=scheduled_at))
+                status=status, scheduled_at=scheduled_at, message_id=message_id)
+            sid = self.db.insert_submission_if_allowed(
+                submission, protect=bool(one_draft and manuscript_id is not None))
+            if sid is None:
+                self._log(f"跳过（一稿一投保护）：{editor.name}")
+                skipped += 1
+                continue
+            if platform:
+                seen_platforms.add(platform)
             jobs.append({"submission_id": sid, "to": editor.email,
                          "subject": subject, "body": body,
+                         "message_id": message_id,
                          "attachment_path": attachment})
         return jobs, skipped
 
@@ -485,7 +574,7 @@ class SubmitPage(QWidget):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
-        self._send_worker = SendWorker(available, jobs, interval_seconds, self)
+        self._send_worker = SendWorker(available, jobs, interval_seconds, self, db=self.db)
         self._send_worker.progress.connect(self._on_send_progress)
         self._send_worker.item_done.connect(self._on_item_done)
         self._send_worker.all_done.connect(self._on_all_done)

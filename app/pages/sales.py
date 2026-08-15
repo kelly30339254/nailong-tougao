@@ -1,8 +1,5 @@
-"""稿费记录页：售出登记（平台/编辑/金额/打款月份）+ 列表 + 统计。"""
+"""稿费记录页：售出登记（平台/编辑/金额/打款日期）+ 列表 + 统计。"""
 from __future__ import annotations
-
-import re
-from datetime import date
 
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtWidgets import (
@@ -13,8 +10,6 @@ from PySide6.QtWidgets import (
 
 from ..models import Sale
 from ..widgets import mk_item
-
-MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
 class SaleDialog(QDialog):
@@ -67,9 +62,15 @@ class SaleDialog(QDialog):
             self.date_edit.setDate(QDate.currentDate())
         form.addRow("售出日期", self.date_edit)
 
-        self.month_edit = QLineEdit(self.sale.payment_month)
-        self.month_edit.setPlaceholderText("如 2026-09")
-        form.addRow("打款月份", self.month_edit)
+        self.payment_date_edit = QLineEdit(self.sale.payment_date)
+        self.payment_date_edit.setPlaceholderText("yyyy-MM-dd，可空")
+        form.addRow("打款日期", self.payment_date_edit)
+        if self.sale.payment_month and not self.sale.payment_date:
+            legacy_hint = QLabel(
+                f"历史记录仅保存到月份：{self.sale.payment_month}，请确认后补充具体日期。")
+            legacy_hint.setObjectName("hintText")
+            legacy_hint.setWordWrap(True)
+            form.addRow("", legacy_hint)
 
         self.notes_edit = QPlainTextEdit(self.sale.notes)
         self.notes_edit.setMaximumHeight(64)
@@ -100,16 +101,18 @@ class SaleDialog(QDialog):
             except ValueError:
                 QMessageBox.warning(self, "提示", "稿费金额请填写数字")
                 return
-        month = self.month_edit.text().strip()
-        if month and not MONTH_RE.match(month):
-            QMessageBox.warning(self, "提示", "打款月份格式应为 yyyy-MM，如 2026-09")
+        payment_date = self.payment_date_edit.text().strip()
+        if payment_date and not QDate.fromString(payment_date, "yyyy-MM-dd").isValid():
+            QMessageBox.warning(self, "提示", "打款日期格式应为 yyyy-MM-dd，如 2026-09-15")
             return
         self.sale.manuscript_id = manuscript_id
         self.sale.platform = self.platform_edit.text().strip()
         self.sale.editor_name = self.editor_edit.text().strip()
         self.sale.amount = amount
         self.sale.sale_date = self.date_edit.date().toString("yyyy-MM-dd")
-        self.sale.payment_month = month
+        self.sale.payment_date = payment_date
+        if payment_date:
+            self.sale.payment_month = ""
         self.sale.notes = self.notes_edit.toPlainText().strip()
         self.accept()
 
@@ -139,7 +142,7 @@ class SalesPage(QWidget):
 
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["文稿", "平台", "编辑", "稿费(元)", "售出日期", "打款月份", "备注", "操作"])
+            ["文稿", "平台", "编辑", "稿费(元)", "售出日期", "打款日期", "备注", "操作"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setAlternatingRowColors(True)
@@ -170,9 +173,11 @@ class SalesPage(QWidget):
 
         self.table.setRowCount(len(sales))
         for row, s in enumerate(sales):
+            payment_text = s.payment_date or (
+                f"{s.payment_month}（仅月份）" if s.payment_month else "")
             values = [s.manuscript_title or "（文稿已删除）", s.platform, s.editor_name,
                       "" if s.amount is None else f"{s.amount:g}",
-                      s.sale_date, s.payment_month, s.notes]
+                      s.sale_date, payment_text, s.notes]
             for col, text in enumerate(values):
                 self.table.setItem(row, col, mk_item(text or ""))
 

@@ -304,8 +304,10 @@ class DashboardPage(QWidget):
                          if e.email}
         if not editor_emails:
             return
+        self._fetch_failures: list[tuple[str, str]] = []
         self._fetch_worker = FetchWorker(mailboxes, editor_emails, lookback_days, self)
         self._fetch_worker.mailbox_result.connect(self._on_mailbox_result)
+        self._fetch_worker.mailbox_failed.connect(self._on_mailbox_failed)
         self._fetch_worker.all_done.connect(self._on_fetch_done)
         self._fetch_worker.start()
 
@@ -313,7 +315,15 @@ class DashboardPage(QWidget):
         """主线程写库：去重 insert replies、匹配 submissions 回写 reply_status。"""
         ingest_results(self.db, address, results)
 
+    def _on_mailbox_failed(self, address: str, error: str):
+        self._fetch_failures.append((address, error))
+
     def _on_fetch_done(self):
         self._fetch_worker = None
+        failures = getattr(self, "_fetch_failures", [])
+        if failures:
+            addresses = "、".join(address for address, _error in failures)
+            self.main_window.statusBar().showMessage(
+                f"后台收信失败（{addresses}），请到回信中心查看邮箱配置。", 10000)
         self.main_window.data_changed.emit()
         self.refresh()

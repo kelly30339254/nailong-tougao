@@ -34,3 +34,15 @@ def build_letter(title: str, word_count, category: str, editor_name: str,
     subject = render_template(subject_tpl or DEFAULT_SUBJECT_TPL, mapping)
     body = render_template(body_tpl or DEFAULT_BODY_TPL, mapping)
     return subject, body
+
+
+def personalize_letter(subject: str, body: str, editor_name: str) -> tuple[str, str]:
+    """只做真实称呼个性化，不随机改写作品事实或插入干扰字符。"""
+    name = (editor_name or "").strip() or "老师"
+    placeholder = "{编辑称呼}"
+    had_placeholder = placeholder in subject or placeholder in body
+    subject = subject.replace(placeholder, name)
+    body = body.replace(placeholder, name)
+    if not had_placeholder and editor_name.strip():
+        body = f"{name}，您好：\n\n{body}"
+    return subject, body

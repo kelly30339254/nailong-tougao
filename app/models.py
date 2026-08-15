@@ -50,6 +50,7 @@ class Submission:
     sent_at: str = ""
     replied_at: str = ""
     scheduled_at: str = ""
+    message_id: str = ""
 
 
 @dataclass
@@ -62,6 +63,15 @@ class Reply:
     verdict: str = "其他"         # 过稿 / 退稿 / 需修改 / 其他
     is_read: bool = False
     imap_uid: str = ""
+    mailbox_address: str = ""
+    imap_folder: str = "INBOX"
+    uid_validity: str = ""
+    message_id: str = ""
+    in_reply_to: str = ""
+    references: str = ""
+    is_auto_reply: bool = False
+    classification_confidence: str = ""
+    classification_reason: str = ""
     received_at: str = ""
 
 
@@ -74,6 +84,7 @@ class Sale:
     amount: float | None = None      # 稿费金额（元），可空
     sale_date: str = ""              # yyyy-MM-dd
     payment_month: str = ""          # yyyy-MM
+    payment_date: str = ""           # yyyy-MM-dd
     notes: str = ""
     created_at: str = ""
     manuscript_title: str = ""       # 联表查询时填充，非表字段

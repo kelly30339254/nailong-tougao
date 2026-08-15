@@ -24,7 +24,8 @@ QT_QPA_PLATFORM=offscreen NAILONG_SMOKE=1 .venv/Scripts/python.exe main.py   # �
 
 ## 打包 exe
 
-双击 `build_exe.bat`（PyInstaller `--onefile --noconsole`），产物为 `dist\奶龙投稿助手.exe`。
+- 便携版：双击 `build_exe.bat`（PyInstaller `--onefile --noconsole`），产物为 `dist\奶龙投稿助手.exe`。
+- **安装版**：双击 `build_installer.bat`（需先 `winget install JRSoftware.InnoSetup`），产物为 `dist\奶龙投稿助手-<版本>-windows-setup.exe`。安装/卸载不影响激活（激活数据在数据目录，见下）。
 
 ## 数据目录
 
@@ -42,8 +43,8 @@ QT_QPA_PLATFORM=offscreen NAILONG_SMOKE=1 .venv/Scripts/python.exe main.py   # �
 ## 系统要求与多平台打包
 
 - **Windows 10 / 11 64 位**（不支持 Win7：Qt6 与 Python 3.9+ 均已放弃 Win7）
-- **macOS 11+**：CI 产物为 `奶龙投稿助手.app`（zip 压缩）。未做苹果签名，首次打开请「右键 → 打开」，或在终端执行 `xattr -dr com.apple.quarantine 奶龙投稿助手.app`
-- **Linux**（主流发行版）：CI 产物为单文件可执行程序（tar.gz）。若运行报缺库，安装 Qt 运行依赖，如 Debian/Ubuntu：`sudo apt install libegl1 libxkbcommon0 libxcb-cursor0`
+- **macOS 11+**：CI 产物为 `.dmg` 安装包（打开后把 App 拖进 Applications）。未做苹果签名，首次打开请「右键 → 打开」，或在终端执行 `xattr -dr com.apple.quarantine /Applications/奶龙投稿助手.app`
+- **Linux**（Debian/Ubuntu）：CI 产物为 `.deb` 安装包，`sudo apt install ./奶龙投稿助手-*-linux-amd64.deb` 即可（自动带出 Qt 运行依赖），安装后应用菜单出现「奶龙投稿助手」；卸载：`sudo apt remove nailong-post`
 
 ### Windows 打开时报错「DLL load failed / QtWidgets / 找不到指定的模块」
 
@@ -73,6 +74,21 @@ pyinstaller 奶龙投稿助手.spec   # 产物在 dist/
 4. **投稿方案**：选文稿 → 生成投稿信 → 勾选编辑 → 开始投稿（多邮箱轮转、逐封发送、进度日志）
 5. **回信中心**：立即收信或等后台自动收信，自动判定过稿/退稿/需修改并回写投递记录
 6. **工作台**：查看统计、新手指引与近期动态
+
+## 内置详细教程
+
+软件顶栏的「使用教程」会打开离线可读的《奶龙投稿助手：功能列表与使用教程》，内容覆盖：
+
+- 编辑列表的同步、筛选、收藏、小黑屋、CSV 导入导出和来源核验
+- 发信邮箱授权码配置、SMTP/IMAP 测试、模板占位符、投递策略和后台收信
+- 文稿库的 TXT/DOCX 导入、字数统计、作品标签、附件和售出状态
+- 智选排序的匹配原因、人工勾选、立即/定时投递、邮箱轮换、额度和日志
+- 一稿一投保护、停止收稿/失效邮箱/同平台重复编辑的跳过规则
+- 回信关联、自动回复识别、待确认处理、退信恢复和人工确认边界
+- 投递记录、催稿提醒、工作台统计、稿费登记、备份恢复与换电脑流程
+- 授权失败、垃圾箱、智选不准确、收不到回信等常见问题和发送前检查清单
+
+教程强调：智选结果和回信分类都是辅助信息，发送前必须核实征稿要求，最终投稿选择和回信结论由作者确认。数据主要保存在本机；备份包含业务数据和普通设置，但不包含邮箱授权码。
 
 ## 注意事项
 

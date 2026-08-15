@@ -130,7 +130,7 @@ warnings.clear()
 import app.mailer as mailer_mod
 send_calls = []
 orig_send = mailer_mod.send_mail
-def fake_send(mailbox, to, subject, body, attachment_path=None):
+def fake_send(mailbox, to, subject, body, attachment_path=None, message_id=None):
     send_calls.append((mailbox.address, to))
     if to == "ed3@x.com":
         raise Exception("535 模拟失败")
@@ -153,7 +153,7 @@ finally:
     mailer_mod.send_mail = orig_send
 
 log_text = submit_page.log_edit.toPlainText()
-check("一稿一投跳过日志", "跳过（未回复）：编辑一" in log_text)
+check("一稿一投跳过日志", "跳过（一稿一投保护）：编辑一" in log_text)
 check("只发 2 封（ed2/ed3）", len(send_calls) == 2
       and {c[1] for c in send_calls} == {"ed2@x.com", "ed3@x.com"})
 check("全部完成日志", "全部完成：成功 1 失败 1 跳过 1" in log_text)
@@ -254,7 +254,7 @@ for page_id in ("dashboard", "submit", "records", "replies", "sales",
 # ---------- 问题 1-8 防回归断言 ----------
 from PySide6.QtWidgets import QHeaderView, QLabel
 from app.theme import render_qss
-from app.main_window import PromoButton
+from app.main_window import PromoButton, TUTORIAL_ACTION
 
 qss = render_qss("蔷薇粉")
 check("combo 下拉箭头样式（SVG 路径已替换）", "arrow_down.svg" in qss
@@ -283,7 +283,16 @@ check("设置页 6 个标签无作者与落款", len(settings_tabs) == 6
       and "作者与落款" not in settings_tabs
       and "投稿信模板" in settings_tabs and "数据备份" in settings_tabs)
 check("侧栏无分组标签", len(win.findChildren(QLabel, "navGroupLabel")) == 0)
-check("顶栏 2 个宣传按钮", len(win.findChildren(PromoButton)) == 2)
+promo_buttons = win.findChildren(PromoButton)
+check("顶栏 3 个功能按钮", len(promo_buttons) == 3
+      and sum(button._url == TUTORIAL_ACTION for button in promo_buttons) == 1
+      and all("BV1pMMQ6MEBx" not in button._url for button in promo_buttons))
+tutorial_dialog = win._create_tutorial_dialog()
+tutorial_text = tutorial_dialog.browser.toPlainText()
+check("本地文字教程内容完整", all(section in tutorial_text for section in (
+    "功能总览", "第一次使用", "智选编辑", "邮箱授权码", "定时投递",
+    "回信与人工确认", "稿费和备份", "常见问题")))
+tutorial_dialog.close()
 check("表格单元格带 tooltip", win._pages["editors"].table.item(0, 1).toolTip()
       == win._pages["editors"].table.item(0, 1).text())
 check("文稿下拉项带 tooltip", submit_page.manuscript_combo.count() >= 1)

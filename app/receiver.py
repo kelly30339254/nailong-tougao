@@ -15,6 +15,7 @@ _TIMEOUT = 30
 # 退信通知识别：From 含这些标识，或主题含退信关键词
 _BOUNCE_FROM_HINTS = ("mailer-daemon", "postmaster")
 _BOUNCE_SUBJECT_WORDS = ("退信", "Delivery Status", "Undelivered", "无法投递", "投递失败")
+_AUTO_SUBJECT_PREFIXES = ("自动回复", "自动答复", "auto reply", "out of office")
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
@@ -23,6 +24,20 @@ def _is_bounce(from_email: str, subject: str) -> bool:
     if any(h in from_email for h in _BOUNCE_FROM_HINTS):
         return True
     return any(w in subject for w in _BOUNCE_SUBJECT_WORDS)
+
+
+def _is_auto_reply(msg, subject: str) -> bool:
+    """依据标准/常见邮件头和主题前缀识别自动回复。"""
+    auto_submitted = str(msg.get("Auto-Submitted") or "").strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return True
+    precedence = str(msg.get("Precedence") or "").strip().lower()
+    if precedence in {"bulk", "list", "junk"}:
+        return True
+    if msg.get("X-Autoreply") is not None or msg.get("X-Autorespond") is not None:
+        return True
+    lowered = (subject or "").strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _AUTO_SUBJECT_PREFIXES)
 
 
 def _decode_str(value: str | None) -> str:
@@ -89,6 +104,16 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
     try:
         imap.login(mailbox.address, mailbox.auth_code)
         imap.select("INBOX", readonly=True)
+        uid_validity = ""
+        try:
+            _typ, uid_data = imap.response("UIDVALIDITY")
+            if uid_data and uid_data[0] is not None:
+                raw_uid_validity = uid_data[0]
+                if isinstance(raw_uid_validity, bytes):
+                    raw_uid_validity = raw_uid_validity.decode(errors="replace")
+                uid_validity = str(raw_uid_validity).strip()
+        except Exception:
+            pass
         typ, data = imap.search(None, "SINCE", since)
         if typ != "OK" or not data or not data[0]:
             return results
@@ -109,6 +134,10 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
                 continue
             from_email = _extract_address(msg.get("From", ""))
             subject = _decode_str(msg.get("Subject", ""))
+            message_id = _decode_str(msg.get("Message-ID", "")).strip()
+            in_reply_to = _decode_str(msg.get("In-Reply-To", "")).strip()
+            reference_ids = _decode_str(msg.get("References", "")).strip()
+            is_auto_reply = _is_auto_reply(msg, subject)
             body = _extract_body(msg)
             snippet = re.sub(r"\s+", " ", body).strip()[:300]
             bounce = _is_bounce(from_email, subject)
@@ -131,6 +160,13 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
                 "subject": subject,
                 "snippet": snippet,
                 "uid": uid,
+                "mailbox_address": mailbox.address,
+                "imap_folder": "INBOX",
+                "uid_validity": uid_validity,
+                "message_id": message_id,
+                "in_reply_to": in_reply_to,
+                "references": reference_ids,
+                "is_auto_reply": is_auto_reply,
                 "received_at": received_at,
                 "is_bounce": bounce,
                 "bounced_recipients": bounced,

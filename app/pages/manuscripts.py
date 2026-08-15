@@ -215,10 +215,15 @@ class ManuscriptsPage(QWidget):
             sale = sold_map.get(m.id)
             if sale is not None:
                 amount_text = f" {sale.amount:g}元" if sale.amount is not None else ""
-                month_text = f" {sale.payment_month} 打款" if sale.payment_month else ""
+                if sale.payment_date:
+                    payment_text = f" {sale.payment_date} 打款"
+                elif sale.payment_month:
+                    payment_text = f" {sale.payment_month} 打款（仅月份）"
+                else:
+                    payment_text = ""
                 self.table.setCellWidget(row, 1, badge_cell(
                     "已售", "pass",
-                    tooltip=f"已售：{sale.platform} {sale.editor_name}{amount_text}{month_text}"))
+                    tooltip=f"已售：{sale.platform} {sale.editor_name}{amount_text}{payment_text}"))
 
             values = [str(m.word_count or ""), m.category, m.reader_group,
                       m.emotion, m.style, m.genre_type, m.created_at]

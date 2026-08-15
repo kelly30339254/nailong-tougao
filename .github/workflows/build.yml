@@ -43,20 +43,21 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path "dist/奶龙投稿助手.exe" -DestinationPath "奶龙投稿助手-windows.zip"
 
-      - name: 整理产物（macOS）
+      - name: 制作 DMG 安装包（macOS）
         if: runner.os == 'macOS'
-        run: cd dist && zip -r -y "../奶龙投稿助手-macos.zip" "奶龙投稿助手.app"
+        run: bash scripts/make_dmg.sh
 
-      - name: 整理产物（Linux）
+      - name: 制作 DEB 安装包（Linux）
         if: runner.os == 'Linux'
-        run: tar -czf "奶龙投稿助手-linux.tar.gz" -C dist "奶龙投稿助手"
+        run: bash scripts/make_deb.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: |
             奶龙投稿助手-*.zip
-            奶龙投稿助手-*.tar.gz
+            奶龙投稿助手-*.dmg
+            奶龙投稿助手-*.deb
 
       - name: 发布 Release（打 v* 标签时）
         if: startsWith(github.ref, 'refs/tags/v')
@@ -64,4 +65,5 @@ jobs:
         with:
           files: |
             奶龙投稿助手-*.zip
-            奶龙投稿助手-*.tar.gz
+            奶龙投稿助手-*.dmg
+            奶龙投稿助手-*.deb

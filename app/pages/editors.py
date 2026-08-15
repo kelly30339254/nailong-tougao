@@ -25,6 +25,7 @@ from ..workers import SyncEditorsWorker
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DIRECTIONS_PREVIEW_LENGTH = 5
 DIRECTIONS_COLUMN_WIDTH = 104
+PAGE_SIZE = 50
 
 CSV_HEADERS = ["名称", "平台", "邮箱", "题材", "收稿方向", "状态", "稿费", "来源", "备注"]
 _HEADER_ALIASES = {
@@ -117,6 +118,7 @@ class EditorsPage(QWidget):
         self.db = db
         self.store = store
         self.main_window = main_window
+        self._page = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
@@ -128,24 +130,29 @@ class EditorsPage(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索编辑 / 平台 / 邮箱 / 题材…")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self._reload_table)
+        self.search_edit.textChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self.search_edit, 2)
 
         self.platform_combo = QComboBox()
-        self.platform_combo.currentIndexChanged.connect(self._reload_table)
+        self.platform_combo.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self.platform_combo)
         self.genre_combo = QComboBox()
-        self.genre_combo.currentIndexChanged.connect(self._reload_table)
+        self.genre_combo.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self.genre_combo)
         self.direction_combo = QComboBox()
-        self.direction_combo.currentIndexChanged.connect(self._reload_table)
+        self.direction_combo.currentIndexChanged.connect(self._on_filter_changed)
         toolbar.addWidget(self.direction_combo)
+        self.blacklist_combo = QComboBox()
+        self.blacklist_combo.addItems(["正常编辑", "小黑屋", "全部编辑"])
+        self.blacklist_combo.setToolTip("查看正常编辑、小黑屋编辑，或全部编辑")
+        self.blacklist_combo.currentIndexChanged.connect(self._on_filter_changed)
+        toolbar.addWidget(self.blacklist_combo)
         self.fav_check = QCheckBox("只看收藏")
-        self.fav_check.toggled.connect(self._reload_table)
+        self.fav_check.toggled.connect(self._on_filter_changed)
         toolbar.addWidget(self.fav_check)
         self.accepting_check = QCheckBox("只看正在收稿")
         self.accepting_check.setToolTip("仅显示状态为“正常收稿”的编辑")
-        self.accepting_check.toggled.connect(self._reload_table)
+        self.accepting_check.toggled.connect(self._on_filter_changed)
         toolbar.addWidget(self.accepting_check)
         toolbar.addStretch(1)
 
@@ -206,6 +213,24 @@ class EditorsPage(QWidget):
         header.setStretchLastSection(False)
         layout.addWidget(self.table, 1)
 
+        # 分页栏：每页 PAGE_SIZE 人，避免一次性创建数千行的按钮控件
+        pager = QHBoxLayout()
+        pager.setSpacing(8)
+        pager.addStretch()
+        self.prev_btn = QPushButton("上一页")
+        self.prev_btn.setObjectName("iconBtn")
+        self.prev_btn.clicked.connect(lambda: self._goto_page(self._page - 1))
+        pager.addWidget(self.prev_btn)
+        self.page_label = QLabel()
+        self.page_label.setObjectName("hintText")
+        pager.addWidget(self.page_label)
+        self.next_btn = QPushButton("下一页")
+        self.next_btn.setObjectName("iconBtn")
+        self.next_btn.clicked.connect(lambda: self._goto_page(self._page + 1))
+        pager.addWidget(self.next_btn)
+        pager.addStretch()
+        layout.addLayout(pager)
+
         self.refresh()
 
     # ---------- 数据 ----------
@@ -219,7 +244,12 @@ class EditorsPage(QWidget):
         direction = None if direction in ("", "全部方向") else direction
         editors = self.db.list_editors(
             keyword=keyword, platform=platform, genre=genre, direction=direction,
-            favorites_only=self.fav_check.isChecked())
+            favorites_only=self.fav_check.isChecked(), include_blacklisted=True)
+        blacklist_mode = self.blacklist_combo.currentText()
+        if blacklist_mode == "正常编辑":
+            editors = [e for e in editors if not e.blacklisted]
+        elif blacklist_mode == "小黑屋":
+            editors = [e for e in editors if e.blacklisted]
         if self.accepting_check.isChecked():
             editors = [e for e in editors if (e.status or "").strip() == "正常收稿"]
         return editors
@@ -256,8 +286,31 @@ class EditorsPage(QWidget):
 
         self._reload_table()
 
+    def _on_filter_changed(self, *_args):
+        """筛选条件变化：回到第一页。"""
+        self._page = 0
+        self._reload_table()
+
+    def _goto_page(self, page: int):
+        self._page = page
+        self._reload_table()
+
+    def _update_pager(self, total: int, pages: int):
+        if total == 0:
+            self.page_label.setText("共 0 人")
+        else:
+            self.page_label.setText(f"第 {self._page + 1} / {pages} 页（共 {total} 人）")
+        self.prev_btn.setEnabled(self._page > 0)
+        self.next_btn.setEnabled(self._page < pages - 1)
+
     def _reload_table(self):
-        editors = self._current_editors()
+        all_editors = self._current_editors()
+        total = len(all_editors)
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        self._page = min(max(0, self._page), pages - 1)
+        editors = all_editors[self._page * PAGE_SIZE:(self._page + 1) * PAGE_SIZE]
+        self._update_pager(total, pages)
+
         self.table.setRowCount(0)
         if not editors:
             self.table.setRowCount(1)

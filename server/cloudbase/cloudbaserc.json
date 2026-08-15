@@ -1,0 +1,14 @@
+{
+  "$schema": "https://static.cloudbase.net/cli/cloudbaserc.schema.json",
+  "envId": "nailong-d4g922z6h6d9ff59e",
+  "functionRoot": ".",
+  "functions": [
+    {
+      "name": "activate",
+      "timeout": 10,
+      "runtime": "Nodejs20.19",
+      "handler": "index.main",
+      "memorySize": 128
+    }
+  ]
+}

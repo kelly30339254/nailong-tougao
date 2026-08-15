@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QPushButton, QTabWidget,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox,
 )
 
+from .. import APP_VERSION
 from ..models import MailboxConfig
 from ..settings_store import PROVIDER_NAMES, provider_preset
 from ..theme import THEMES
@@ -43,6 +44,12 @@ class MailboxCard(QFrame):
         head.addWidget(QLabel("服务商"))
         head.addWidget(self.provider_combo)
         layout.addLayout(head)
+
+        setup_hint = QLabel(
+            "请填写完整邮箱地址和邮箱授权码（不是登录密码）；服务器地址会按服务商自动配置。")
+        setup_hint.setObjectName("hintText")
+        setup_hint.setWordWrap(True)
+        layout.addWidget(setup_hint)
 
         form = QFormLayout()
         form.setSpacing(6)
@@ -98,6 +105,12 @@ class MailboxCard(QFrame):
         self.test_result.setWordWrap(True)
         bottom.addWidget(self.test_result, 1)
         layout.addLayout(bottom)
+        self._on_provider_changed(self.provider_combo.currentText())
+
+    def _set_server_editable(self, editable: bool):
+        for widget in (self.smtp_host_edit, self.smtp_port_spin, self.smtp_ssl_check,
+                       self.imap_host_edit, self.imap_port_spin):
+            widget.setEnabled(editable)
 
     def _on_provider_changed(self, provider: str):
         smtp_host, smtp_port, smtp_ssl, imap_host, imap_port = provider_preset(provider)
@@ -107,6 +120,7 @@ class MailboxCard(QFrame):
             self.smtp_ssl_check.setChecked(smtp_ssl)
             self.imap_host_edit.setText(imap_host)
             self.imap_port_spin.setValue(imap_port)
+        self._set_server_editable(provider == "自定义")
 
     def to_config(self) -> MailboxConfig:
         return MailboxConfig(
@@ -125,18 +139,29 @@ class MailboxCard(QFrame):
 
     def load_config(self, cfg: MailboxConfig):
         self.enabled_check.setChecked(cfg.enabled)
+        provider = cfg.provider if cfg.provider in PROVIDER_NAMES else "自定义"
         self.provider_combo.blockSignals(True)
-        self.provider_combo.setCurrentText(cfg.provider if cfg.provider in PROVIDER_NAMES else "自定义")
+        self.provider_combo.setCurrentText(provider)
         self.provider_combo.blockSignals(False)
+        smtp_host, smtp_port, smtp_ssl, imap_host, imap_port = provider_preset(provider)
+        if provider == "自定义":
+            smtp_host, smtp_port, smtp_ssl = cfg.smtp_host, cfg.smtp_port, cfg.smtp_ssl
+            imap_host, imap_port = cfg.imap_host, cfg.imap_port
+        else:
+            if cfg.smtp_host:
+                smtp_host, smtp_port, smtp_ssl = cfg.smtp_host, cfg.smtp_port, cfg.smtp_ssl
+            if cfg.imap_host:
+                imap_host, imap_port = cfg.imap_host, cfg.imap_port
         self.address_edit.setText(cfg.address)
         self.auth_edit.setText(cfg.auth_code)
         self.name_edit.setText(cfg.display_name)
-        self.smtp_host_edit.setText(cfg.smtp_host)
-        self.smtp_port_spin.setValue(cfg.smtp_port)
-        self.smtp_ssl_check.setChecked(cfg.smtp_ssl)
-        self.imap_host_edit.setText(cfg.imap_host)
-        self.imap_port_spin.setValue(cfg.imap_port)
+        self.smtp_host_edit.setText(smtp_host)
+        self.smtp_port_spin.setValue(smtp_port)
+        self.smtp_ssl_check.setChecked(smtp_ssl)
+        self.imap_host_edit.setText(imap_host)
+        self.imap_port_spin.setValue(imap_port)
         self.limit_spin.setValue(cfg.daily_limit)
+        self._set_server_editable(provider == "自定义")
 
     def _on_test(self):
         cfg = self.to_config()
@@ -159,6 +184,11 @@ class SettingsPage(QWidget):
         self.db = db
         self.store = store
         self.main_window = main_window
+        self._loading = True
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(700)
+        self._autosave_timer.timeout.connect(self._autosave_now)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 16, 16, 12)
@@ -173,6 +203,7 @@ class SettingsPage(QWidget):
         self._build_fetch_tab()
         self._build_theme_tab()
         self._build_backup_tab()
+        self._build_about_tab()
 
         # 底部栏
         bottom = QHBoxLayout()
@@ -181,15 +212,13 @@ class SettingsPage(QWidget):
         dir_label.setObjectName("hintText")
         bottom.addWidget(dir_label)
         bottom.addStretch()
-        self.save_hint = QLabel("")
+        self.save_hint = QLabel("修改后自动保存")
         bottom.addWidget(self.save_hint)
-        save_btn = QPushButton("保存设置")
-        save_btn.setObjectName("primaryBtn")
-        save_btn.clicked.connect(self.save_all)
-        bottom.addWidget(save_btn)
         outer.addLayout(bottom)
 
         self.refresh()
+        self._connect_auto_save()
+        self._loading = False
 
     # ---------- 标签页：发信邮箱 ----------
     def _build_mailbox_tab(self):
@@ -217,10 +246,12 @@ class SettingsPage(QWidget):
         card = MailboxCard(index, self)
         self.mailbox_cards.append(card)
         self.mailbox_grid.addWidget(card, index // 2, index % 2)
+        if not self._loading:
+            self._connect_mailbox_auto_save(card)
 
     def _on_add_mailbox(self):
         self._append_mailbox_card()
-        self.save_hint.setText("已添加邮箱卡片，点「保存设置」后生效")
+        self._schedule_auto_save()
 
     def _on_test_all(self):
         for card in self.mailbox_cards:
@@ -384,7 +415,8 @@ class SettingsPage(QWidget):
         btn_row.addWidget(reseed_btn)
         btn_row.addStretch()
         vbox.addLayout(btn_row)
-        hint = QLabel("备份包含全部编辑、文稿、投递记录、回信与设置。导入会覆盖当前数据。")
+        hint = QLabel(
+            "备份包含编辑、文稿、投递记录、回信与普通设置，不包含邮箱授权码。导入会覆盖当前数据。")
         hint.setObjectName("hintText")
         hint.setWordWrap(True)
         vbox.addWidget(hint)
@@ -405,6 +437,29 @@ class SettingsPage(QWidget):
         layout.addWidget(clear_card)
         layout.addStretch()
         self.tabs.addTab(tab, "数据备份")
+
+    # ---------- 标签页：关于 ----------
+    def _build_about_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 18, 20, 18)
+        card = QFrame()
+        card.setObjectName("card")
+        vbox = QVBoxLayout(card)
+        vbox.setContentsMargins(20, 18, 20, 18)
+        vbox.setSpacing(10)
+        version_label = QLabel(f"奶龙投稿助手  v{APP_VERSION}")
+        vbox.addWidget(version_label)
+        hint = QLabel("软件启动时会自动检查新版本；有新版本时会提示你到网盘下载最新安装包。")
+        hint.setObjectName("hintText")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+        check_btn = QPushButton("检查更新")
+        check_btn.clicked.connect(lambda: self.main_window.check_update(manual=True))
+        vbox.addWidget(check_btn, 0, Qt.AlignLeft)
+        layout.addWidget(card)
+        layout.addStretch()
+        self.tabs.addTab(tab, "关于")
 
     def _refresh_backup_info(self):
         size = self.db.db_file_size()
@@ -489,6 +544,61 @@ class SettingsPage(QWidget):
             radio.setChecked(True)
             radio.blockSignals(False)
 
+    # ---------- 自动保存 ----------
+    def _connect_mailbox_auto_save(self, card: MailboxCard):
+        for signal in (
+            card.enabled_check.toggled,
+            card.provider_combo.currentIndexChanged,
+            card.address_edit.textEdited,
+            card.auth_edit.textEdited,
+            card.name_edit.textEdited,
+            card.smtp_host_edit.textEdited,
+            card.smtp_port_spin.valueChanged,
+            card.smtp_ssl_check.toggled,
+            card.imap_host_edit.textEdited,
+            card.imap_port_spin.valueChanged,
+            card.limit_spin.valueChanged,
+        ):
+            signal.connect(self._schedule_auto_save)
+
+    def _connect_auto_save(self):
+        for card in self.mailbox_cards:
+            self._connect_mailbox_auto_save(card)
+        for signal in (
+            self.letter_subject_edit.textEdited,
+            self.letter_body_edit.textChanged,
+            self.one_draft_check.toggled,
+            self.interval_spin.valueChanged,
+            self.daily_limit_spin.valueChanged,
+            self.urge_days_spin.valueChanged,
+            self.auto_fetch_check.toggled,
+            self.fetch_interval_spin.valueChanged,
+            self.lookback_spin.valueChanged,
+        ):
+            signal.connect(self._schedule_auto_save)
+
+    def _schedule_auto_save(self, *_args):
+        if self._loading:
+            return
+        self.save_hint.setText("保存中…")
+        self.save_hint.setStyleSheet("color: #8A8087;")
+        self._autosave_timer.start()
+
+    def _autosave_now(self):
+        if self._loading:
+            return
+        self._autosave_timer.stop()
+        try:
+            self.save_all()
+        except Exception as exc:
+            self.save_hint.setText(f"保存失败：{exc}")
+            self.save_hint.setStyleSheet("color: #E03131;")
+
+    def hideEvent(self, event):
+        if self._autosave_timer.isActive():
+            self._autosave_now()
+        super().hideEvent(event)
+
     # ---------- 工具 ----------
     @staticmethod
     def _scrollable(widget: QWidget) -> QScrollArea:
@@ -500,6 +610,7 @@ class SettingsPage(QWidget):
 
     # ---------- 载入 / 保存 ----------
     def refresh(self):
+        self._loading = True
         # 邮箱
         mailboxes = self.store.load_mailboxes()
         for card, cfg in zip(self.mailbox_cards, mailboxes):
@@ -523,6 +634,7 @@ class SettingsPage(QWidget):
         self.sync_theme_selection(self.store.get_theme())
         # 备份信息
         self._refresh_backup_info()
+        self._loading = False
 
     def save_all(self):
         for i, card in enumerate(self.mailbox_cards):

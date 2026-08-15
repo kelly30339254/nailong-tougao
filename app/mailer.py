@@ -9,7 +9,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid
 
 from .models import MailboxConfig
 
@@ -24,7 +24,8 @@ def _display_name(mailbox: MailboxConfig) -> str:
 
 
 def send_mail(mailbox: MailboxConfig, to: str, subject: str, body: str,
-              attachment_path: str | None = None):
+              attachment_path: str | None = None,
+              message_id: str | None = None) -> str:
     """发送邮件，异常向上抛出。"""
     from_addr = formataddr((str(Header(_display_name(mailbox), "utf-8")), mailbox.address))
 
@@ -45,6 +46,9 @@ def send_mail(mailbox: MailboxConfig, to: str, subject: str, body: str,
     msg["From"] = from_addr
     msg["To"] = to
     msg["Subject"] = Header(subject, "utf-8")
+    domain = mailbox.address.rsplit("@", 1)[-1] if "@" in mailbox.address else None
+    actual_message_id = (message_id or "").strip() or make_msgid(domain=domain)
+    msg["Message-ID"] = actual_message_id
 
     if mailbox.smtp_ssl:
         server = smtplib.SMTP_SSL(mailbox.smtp_host, mailbox.smtp_port, timeout=_TIMEOUT)
@@ -61,6 +65,7 @@ def send_mail(mailbox: MailboxConfig, to: str, subject: str, body: str,
             server.quit()
         except Exception:
             pass
+    return actual_message_id
 
 
 def _friendly_error(exc: Exception) -> str:

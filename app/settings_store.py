@@ -5,6 +5,7 @@ import json
 
 from .db import Database
 from .models import MailboxConfig, AuthorInfo
+from . import credential_store
 
 DEFAULT_MAILBOX_COUNT = 6
 DEFAULT_THEME = "蔷薇粉"
@@ -30,6 +31,27 @@ PROVIDER_NAMES = list(_PROVIDER_PRESETS.keys())
 class SettingsStore:
     def __init__(self, db: Database):
         self.db = db
+        # Migrate legacy JSON auth codes before exposing mailbox settings.
+        raw_count = self.get("mailbox_count", "")
+        try:
+            count = max(1, int(raw_count)) if raw_count else DEFAULT_MAILBOX_COUNT
+        except ValueError:
+            count = DEFAULT_MAILBOX_COUNT
+        for i in range(count):
+            key = f"mailbox_{i}"
+            raw = self.get(key, "")
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            auth_code = data.get("auth_code", "")
+            if not isinstance(auth_code, str) or not auth_code:
+                continue
+            if credential_store.set(key, auth_code):
+                data.pop("auth_code", None)
+                self.set(key, json.dumps(data, ensure_ascii=False))
 
     # ---------- 基础键值 ----------
     def get(self, key: str, default: str = "") -> str:
@@ -58,11 +80,13 @@ class SettingsStore:
             if raw:
                 try:
                     d = json.loads(raw)
+                    stored_auth_code = credential_store.get(f"mailbox_{i}")
                     result.append(MailboxConfig(
                         enabled=bool(d.get("enabled", False)),
                         provider=d.get("provider", "QQ邮箱"),
                         address=d.get("address", ""),
-                        auth_code=d.get("auth_code", ""),
+                        auth_code=stored_auth_code if stored_auth_code is not None
+                        else d.get("auth_code", ""),
                         display_name=d.get("display_name", ""),
                         smtp_host=d.get("smtp_host", ""),
                         smtp_port=int(d.get("smtp_port", 465)),
@@ -78,9 +102,15 @@ class SettingsStore:
         return result
 
     def save_mailbox(self, index: int, cfg: MailboxConfig):
+        key = f"mailbox_{index}"
+        if cfg.auth_code:
+            if not credential_store.set(key, cfg.auth_code):
+                raise RuntimeError("无法安全保存邮箱授权码")
+        elif not credential_store.delete(key):
+            raise RuntimeError("无法删除邮箱授权码")
         d = {
             "enabled": cfg.enabled, "provider": cfg.provider, "address": cfg.address,
-            "auth_code": cfg.auth_code, "display_name": cfg.display_name,
+            "display_name": cfg.display_name,
             "smtp_host": cfg.smtp_host, "smtp_port": cfg.smtp_port, "smtp_ssl": cfg.smtp_ssl,
             "imap_host": cfg.imap_host, "imap_port": cfg.imap_port,
             "daily_limit": cfg.daily_limit,

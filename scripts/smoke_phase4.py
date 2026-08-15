@@ -138,7 +138,7 @@ submit_page.subject_edit.setText("")
 submit_page.body_edit.setPlainText("")
 submit_page._on_build_letter()
 check("投稿页用自定义模板", submit_page.subject_edit.text() == "【投稿】测试文稿-悬疑"
-      and submit_page.body_edit.toPlainText().startswith("致老师："))
+      and submit_page.body_edit.toPlainText().startswith("致{编辑称呼}："))
 settings_page._on_reset_letter_tpl()
 check("恢复默认模板", settings_page.letter_subject_edit.text() == DEFAULT_SUBJECT_TPL)
 store.save_letter_template(DEFAULT_SUBJECT_TPL, "")  # 正文空 → 默认
@@ -201,7 +201,7 @@ check("到点可查", len(db.due_scheduled()) == 1)
 import app.mailer as mailer_mod
 sent_calls = []
 orig_send = mailer_mod.send_mail
-mailer_mod.send_mail = lambda mailbox, to, subject, body, attachment_path=None: sent_calls.append(to)
+mailer_mod.send_mail = lambda mailbox, to, subject, body, attachment_path=None, message_id=None: sent_calls.append(to)
 try:
     win._check_scheduled()
     worker = win._sched_worker

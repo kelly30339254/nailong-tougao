@@ -6,8 +6,9 @@
 import os
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
+from app import license as lic
 from app.db import Database
 from app.settings_store import SettingsStore
 from app.theme import apply_theme, THEMES, DEFAULT_THEME
@@ -52,6 +53,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("奶龙投稿助手")
+    if not lic.is_activated():
+        from app.activation_dialog import ActivationDialog
+        if ActivationDialog().exec() != QDialog.Accepted:
+            sys.exit(0)
     window = _make_window()
     window.show()
     sys.exit(app.exec())

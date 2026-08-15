@@ -6,7 +6,7 @@ import time
 from PySide6.QtCore import QThread, Signal
 
 from .models import MailboxConfig
-from . import mailer, receiver, updater
+from . import mailer, receiver, updater, update_check
 
 
 class TestMailboxWorker(QThread):
@@ -32,12 +32,13 @@ class SendWorker(QThread):
     all_done = Signal()
 
     def __init__(self, mailboxes: list[MailboxConfig], jobs: list[dict],
-                 interval_seconds: int, parent=None):
+                 interval_seconds: int, parent=None, db=None):
         super().__init__(parent)
         # 只保留已启用的邮箱
         self.mailboxes = [m for m in mailboxes if m.enabled]
         self.jobs = jobs
         self.interval_seconds = interval_seconds
+        self.db = db
         self._stopped = False
 
     def stop(self):
@@ -56,13 +57,32 @@ class SendWorker(QThread):
             if self._stopped:
                 self.progress.emit(i, total, "已手动停止")
                 break
-            mailbox = self.mailboxes[i % len(self.mailboxes)]
             sid = job.get("submission_id", -1)
             to = job.get("to", "")
-            self.progress.emit(i + 1, total, f"正在发送 {to}（{mailbox.address}）")
+            mailbox = self.mailboxes[i % len(self.mailboxes)]
             try:
-                mailer.send_mail(mailbox, to, job.get("subject", ""), job.get("body", ""),
-                                 job.get("attachment_path") or None)
+                if self.db is not None:
+                    selected = None
+                    start = i % len(self.mailboxes)
+                    for offset in range(len(self.mailboxes)):
+                        candidate = self.mailboxes[(start + offset) % len(self.mailboxes)]
+                        if self.db.reserve_daily_send(
+                                sid, candidate.address, candidate.daily_limit):
+                            selected = candidate
+                            break
+                    if selected is None:
+                        message = "所有启用邮箱今日额度已用完或任务状态已变化"
+                        self.progress.emit(i + 1, total, f"跳过 {to}：{message}")
+                        self.item_done.emit(sid, False, message, "")
+                        continue
+                    mailbox = selected
+                self.progress.emit(i + 1, total, f"正在发送 {to}（{mailbox.address}）")
+                send_kwargs = {}
+                if job.get("message_id"):
+                    send_kwargs["message_id"] = job["message_id"]
+                mailer.send_mail(
+                    mailbox, to, job.get("subject", ""), job.get("body", ""),
+                    job.get("attachment_path") or None, **send_kwargs)
                 self.item_done.emit(sid, True, "", mailbox.address)
             except Exception as exc:
                 self.item_done.emit(sid, False, str(exc), mailbox.address)
@@ -79,6 +99,7 @@ class FetchWorker(QThread):
 
     progress = Signal(str)
     mailbox_result = Signal(str, list)        # 邮箱地址, 结果 list
+    mailbox_failed = Signal(str, str)         # 邮箱地址, 错误
     all_done = Signal()
 
     def __init__(self, mailboxes: list[MailboxConfig], editor_emails: set,
@@ -95,8 +116,9 @@ class FetchWorker(QThread):
                 results = receiver.fetch_replies(m, self.editor_emails, self.lookback_days)
                 self.mailbox_result.emit(m.address, results)
             except Exception as exc:
-                self.progress.emit(f"{m.address} 收信失败：{exc}")
-                self.mailbox_result.emit(m.address, [])
+                message = str(exc)
+                self.progress.emit(f"{m.address} 收信失败：{message}")
+                self.mailbox_failed.emit(m.address, message)
         self.all_done.emit()
 
 
@@ -119,3 +141,16 @@ class SyncEditorsWorker(QThread):
             self.finished.emit(True, msg, result)
         except Exception as exc:
             self.finished.emit(False, f"同步失败：{exc}", {})
+
+
+class UpdateCheckWorker(QThread):
+    """后台检查新版本。result: (更新信息 dict | None, 错误消息 str)。"""
+
+    result = Signal(object, str)
+
+    def run(self):
+        try:
+            info = update_check.check_for_update()
+            self.result.emit(info, "")
+        except Exception as exc:
+            self.result.emit(None, str(exc))

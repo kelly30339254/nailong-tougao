@@ -191,7 +191,9 @@ from app.main_window import MainWindow
 qapp = QApplication.instance() or QApplication([])
 win = MainWindow(db, store)
 check("窗口标题", win.windowTitle() == "奶龙投稿助手")
-check("邮箱徽标", win.mail_badge.text() == "邮箱已配置 1/4")
+check("邮箱徽标无虚假上限", win.mail_badge.text() == "邮箱已配置 1 个"
+      and "/4" not in win.mail_badge.text()
+      and "继续添加" in win.mail_badge.toolTip())
 
 for page_id in ("dashboard", "submit", "records", "replies",
                 "manuscripts", "editors", "settings"):

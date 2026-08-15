@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS submissions (
     status TEXT DEFAULT '待发',
     reply_status TEXT DEFAULT '无',
     sent_at TEXT DEFAULT '',
-    replied_at TEXT DEFAULT ''
+    replied_at TEXT DEFAULT '',
+    scheduled_at TEXT DEFAULT '',
+    message_id TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +62,15 @@ CREATE TABLE IF NOT EXISTS replies (
     verdict TEXT DEFAULT '其他',
     is_read INTEGER DEFAULT 0,
     imap_uid TEXT DEFAULT '',
+    mailbox_address TEXT DEFAULT '',
+    imap_folder TEXT DEFAULT 'INBOX',
+    uid_validity TEXT DEFAULT '',
+    message_id TEXT DEFAULT '',
+    in_reply_to TEXT DEFAULT '',
+    reference_ids TEXT DEFAULT '',
+    is_auto_reply INTEGER DEFAULT 0,
+    classification_confidence TEXT DEFAULT '',
+    classification_reason TEXT DEFAULT '',
     received_at TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -120,6 +131,25 @@ class Database:
         if "scheduled_at" not in subs_cols:
             self._conn.execute(
                 "ALTER TABLE submissions ADD COLUMN scheduled_at TEXT DEFAULT ''")
+        if "message_id" not in subs_cols:
+            self._conn.execute(
+                "ALTER TABLE submissions ADD COLUMN message_id TEXT DEFAULT ''")
+        replies_cols = {r["name"] for r in
+                        self._conn.execute("PRAGMA table_info(replies)").fetchall()}
+        reply_columns = (
+            ("mailbox_address", "TEXT DEFAULT ''"),
+            ("imap_folder", "TEXT DEFAULT 'INBOX'"),
+            ("uid_validity", "TEXT DEFAULT ''"),
+            ("message_id", "TEXT DEFAULT ''"),
+            ("in_reply_to", "TEXT DEFAULT ''"),
+            ("reference_ids", "TEXT DEFAULT ''"),
+            ("is_auto_reply", "INTEGER DEFAULT 0"),
+            ("classification_confidence", "TEXT DEFAULT ''"),
+            ("classification_reason", "TEXT DEFAULT ''"),
+        )
+        for name, definition in reply_columns:
+            if name not in replies_cols:
+                self._conn.execute(f"ALTER TABLE replies ADD COLUMN {name} {definition}")
         # 稿费记录表
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS sales (
@@ -130,14 +160,19 @@ class Database:
                 amount REAL,
                 sale_date TEXT DEFAULT '',
                 payment_month TEXT DEFAULT '',
+                payment_date TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 created_at TEXT DEFAULT ''
             )""")
-        # 一次性：清空内置数据的来源链接（来源列保留，有值才显示链接）
+        sales_cols = {r["name"] for r in
+                      self._conn.execute("PRAGMA table_info(sales)").fetchall()}
+        if "payment_date" not in sales_cols:
+            self._conn.execute(
+                "ALTER TABLE sales ADD COLUMN payment_date TEXT DEFAULT ''")
+        # 旧版本曾错误清空全部来源链接；这里只保留迁移标记，不再修改用户数据。
         marker = self._conn.execute(
             "SELECT value FROM settings WHERE key='source_cleared_v1'").fetchone()
         if not marker:
-            self._conn.execute("UPDATE editors SET source_url=''")
             self._conn.execute(
                 "INSERT INTO settings(key, value) VALUES('source_cleared_v1', '1')"
                 " ON CONFLICT(key) DO UPDATE SET value='1'")
@@ -362,7 +397,7 @@ class Database:
         return Sale(id=r["id"], manuscript_id=r["manuscript_id"], platform=r["platform"],
                     editor_name=r["editor_name"], amount=r["amount"],
                     sale_date=r["sale_date"], payment_month=r["payment_month"],
-                    notes=r["notes"], created_at=r["created_at"],
+                    payment_date=r["payment_date"], notes=r["notes"], created_at=r["created_at"],
                     manuscript_title=r["mtitle"] if "mtitle" in r.keys() else "")
 
     def list_sales(self) -> list[Sale]:
@@ -378,18 +413,19 @@ class Database:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO sales(manuscript_id,platform,editor_name,amount,sale_date,"
-                "payment_month,notes,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "payment_month,payment_date,notes,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (s.manuscript_id, s.platform, s.editor_name, s.amount,
-                 s.sale_date, s.payment_month, s.notes, s.created_at or _now()))
+                 s.sale_date, s.payment_month, s.payment_date, s.notes,
+                 s.created_at or _now()))
             return cur.lastrowid
 
     def update_sale(self, s: Sale):
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE sales SET manuscript_id=?,platform=?,editor_name=?,amount=?,"
-                "sale_date=?,payment_month=?,notes=? WHERE id=?",
+                "sale_date=?,payment_month=?,payment_date=?,notes=? WHERE id=?",
                 (s.manuscript_id, s.platform, s.editor_name, s.amount,
-                 s.sale_date, s.payment_month, s.notes, s.id))
+                 s.sale_date, s.payment_month, s.payment_date, s.notes, s.id))
 
     def delete_sale(self, sale_id: int):
         with self._lock, self._conn:
@@ -417,16 +453,61 @@ class Database:
                           from_mailbox=r["from_mailbox"], to_email=r["to_email"],
                           subject=r["subject"], body=r["body"], status=r["status"],
                           reply_status=r["reply_status"], sent_at=r["sent_at"],
-                          replied_at=r["replied_at"], scheduled_at=r["scheduled_at"])
+                          replied_at=r["replied_at"], scheduled_at=r["scheduled_at"],
+                          message_id=r["message_id"])
 
     def insert_submission(self, s: Submission) -> int:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO submissions(manuscript_id,editor_id,from_mailbox,to_email,subject,body,"
-                "status,reply_status,sent_at,replied_at,scheduled_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "status,reply_status,sent_at,replied_at,scheduled_at,message_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.manuscript_id, s.editor_id, s.from_mailbox, s.to_email, s.subject, s.body,
-                 s.status, s.reply_status, s.sent_at, s.replied_at, s.scheduled_at))
+                 s.status, s.reply_status, s.sent_at, s.replied_at, s.scheduled_at,
+                 s.message_id))
             return cur.lastrowid
+
+    def insert_submission_if_allowed(self, s: Submission,
+                                     protect: bool = True) -> int | None:
+        """原子创建投稿；开启一稿一投时，存在活动记录则返回 None。"""
+        columns = ("manuscript_id,editor_id,from_mailbox,to_email,subject,body,"
+                   "status,reply_status,sent_at,replied_at,scheduled_at,message_id")
+        values = (s.manuscript_id, s.editor_id, s.from_mailbox, s.to_email,
+                  s.subject, s.body, s.status, s.reply_status, s.sent_at,
+                  s.replied_at, s.scheduled_at, s.message_id)
+        with self._lock, self._conn:
+            if not protect:
+                marks = ",".join("?" for _ in values)
+                cur = self._conn.execute(
+                    f"INSERT INTO submissions({columns}) VALUES({marks})", values)
+                return cur.lastrowid
+            cur = self._conn.execute(
+                f"INSERT INTO submissions({columns}) "
+                "SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS ("
+                "SELECT 1 FROM submissions WHERE manuscript_id=? AND editor_id=?"
+                " AND (status IN ('待发','定时待发','发送中')"
+                " OR (status='已发' AND reply_status='无')))",
+                values + (s.manuscript_id, s.editor_id))
+            return cur.lastrowid if cur.rowcount == 1 else None
+
+    def reserve_daily_send(self, submission_id: int, mailbox_address: str,
+                           daily_limit: int) -> bool:
+        """逐封原子预留邮箱当日额度，并把任务置为发送中。"""
+        if daily_limit <= 0 or not mailbox_address:
+            return False
+        today = date.today().strftime("%Y-%m-%d") + "%"
+        now = _now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE submissions SET from_mailbox=?,status='发送中',sent_at=?"
+                " WHERE id=? AND status IN ('待发','定时待发')"
+                " AND (SELECT COUNT(*) FROM submissions"
+                " WHERE lower(from_mailbox)=lower(?)"
+                " AND status IN ('已发','发送中','发送结果未知')"
+                " AND sent_at LIKE ?) < ?",
+                (mailbox_address, now, submission_id, mailbox_address, today,
+                 daily_limit))
+            return cur.rowcount == 1
 
     def update_status(self, submission_id: int, status: str, sent_at: str | None = None):
         with self._lock, self._conn:
@@ -571,6 +652,19 @@ class Database:
             dest = sqlite3.connect(dest_path)
             try:
                 self._conn.backup(dest)
+                rows = dest.execute(
+                    "SELECT key,value FROM settings WHERE key LIKE 'mailbox_%'").fetchall()
+                for key, value in rows:
+                    try:
+                        data = json.loads(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(data, dict) and "auth_code" in data:
+                        data.pop("auth_code", None)
+                        dest.execute(
+                            "UPDATE settings SET value=? WHERE key=?",
+                            (json.dumps(data, ensure_ascii=False), key))
+                dest.commit()
             finally:
                 dest.close()
 
@@ -601,13 +695,48 @@ class Database:
         return [self._row_to_submission(r) for r in rows]
 
     def find_pending(self, manuscript_id: int, editor_id: int) -> Submission | None:
-        """一稿一投判定：同稿件同编辑存在 已发且 reply_status=无 的记录。"""
+        """一稿一投判定：待发、发送中或已发未回复均视为活动记录。"""
         with self._lock:
             r = self._conn.execute(
                 "SELECT * FROM submissions WHERE manuscript_id=? AND editor_id=?"
-                " AND status='已发' AND reply_status='无' ORDER BY id DESC LIMIT 1",
+                " AND (status IN ('待发','定时待发','发送中')"
+                " OR (status='已发' AND reply_status='无'))"
+                " ORDER BY id DESC LIMIT 1",
                 (manuscript_id, editor_id)).fetchone()
         return self._row_to_submission(r) if r else None
+
+    def find_submission_for_reply(self, from_email: str, mailbox_address: str,
+                                  referenced_message_ids: list[str]) -> Submission | None:
+        """按邮件线程精确关联；没有线程信息时只接受唯一邮箱候选。"""
+        message_ids = list(dict.fromkeys(
+            value.strip() for value in referenced_message_ids if value and value.strip()))
+        with self._lock:
+            if message_ids:
+                marks = ",".join("?" for _ in message_ids)
+                rows = self._conn.execute(
+                    f"SELECT * FROM submissions WHERE message_id IN ({marks})"
+                    " AND lower(to_email)=lower(?)"
+                    " AND lower(from_mailbox)=lower(?)",
+                    message_ids + [from_email, mailbox_address]).fetchall()
+                if len(rows) == 1:
+                    return self._row_to_submission(rows[0])
+                if len(rows) > 1:
+                    return None
+            rows = self._conn.execute(
+                "SELECT * FROM submissions WHERE status='已发' AND reply_status='无'"
+                " AND lower(to_email)=lower(?)"
+                " AND lower(from_mailbox)=lower(?)",
+                (from_email, mailbox_address)).fetchall()
+            if len(rows) == 1:
+                return self._row_to_submission(rows[0])
+            if len(rows) > 1:
+                return None
+            # 兼容旧记录：早期版本未保存发件邮箱，仅在候选唯一时关联。
+            rows = self._conn.execute(
+                "SELECT * FROM submissions WHERE status='已发' AND reply_status='无'"
+                " AND lower(to_email)=lower(?)",
+                (from_email,)).fetchall()
+        return self._row_to_submission(rows[0]) if len(rows) == 1 else None
 
     def count_editor_last_days(self, editor_id: int, days: int = 7) -> int:
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -632,22 +761,39 @@ class Database:
         return Reply(id=r["id"], submission_id=r["submission_id"], from_email=r["from_email"],
                      subject=r["subject"], snippet=r["snippet"], verdict=r["verdict"],
                      is_read=bool(r["is_read"]), imap_uid=r["imap_uid"],
+                     mailbox_address=r["mailbox_address"],
+                     imap_folder=r["imap_folder"], uid_validity=r["uid_validity"],
+                     message_id=r["message_id"], in_reply_to=r["in_reply_to"],
+                     references=r["reference_ids"], is_auto_reply=bool(r["is_auto_reply"]),
+                     classification_confidence=r["classification_confidence"],
+                     classification_reason=r["classification_reason"],
                      received_at=r["received_at"])
 
     def insert_reply(self, r: Reply) -> int | None:
         """按 imap_uid + from_email 去重，重复返回 None。"""
         with self._lock, self._conn:
             if r.imap_uid:
-                dup = self._conn.execute(
-                    "SELECT id FROM replies WHERE imap_uid=? AND from_email=?",
-                    (r.imap_uid, r.from_email)).fetchone()
+                if r.mailbox_address:
+                    dup = self._conn.execute(
+                        "SELECT id FROM replies WHERE mailbox_address=? AND imap_folder=?"
+                        " AND uid_validity=? AND imap_uid=?",
+                        (r.mailbox_address, r.imap_folder, r.uid_validity, r.imap_uid)).fetchone()
+                else:
+                    dup = self._conn.execute(
+                        "SELECT id FROM replies WHERE imap_uid=? AND from_email=?",
+                        (r.imap_uid, r.from_email)).fetchone()
                 if dup:
                     return None
             cur = self._conn.execute(
-                "INSERT INTO replies(submission_id,from_email,subject,snippet,verdict,is_read,imap_uid,received_at)"
-                " VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO replies(submission_id,from_email,subject,snippet,verdict,is_read,imap_uid,"
+                "mailbox_address,imap_folder,uid_validity,message_id,in_reply_to,reference_ids,"
+                "is_auto_reply,classification_confidence,classification_reason,received_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.submission_id, r.from_email, r.subject, r.snippet, r.verdict,
-                 int(r.is_read), r.imap_uid, r.received_at or _now()))
+                 int(r.is_read), r.imap_uid, r.mailbox_address, r.imap_folder,
+                 r.uid_validity, r.message_id, r.in_reply_to, r.references,
+                 int(r.is_auto_reply), r.classification_confidence,
+                 r.classification_reason, r.received_at or _now()))
             return cur.lastrowid
 
     def list_replies(self, unread_only: bool = False) -> list[Reply]:
@@ -658,6 +804,25 @@ class Database:
         with self._lock:
             rows = self._conn.execute(sql).fetchall()
         return [self._row_to_reply(r) for r in rows]
+
+    def confirm_reply_verdict(self, reply_id: int, verdict: str) -> bool:
+        """保存用户确认结果；有唯一投稿关联时同步更新投稿状态。"""
+        if verdict not in {"过稿", "退稿", "需修改", "其他"}:
+            raise ValueError("不支持的回信判定")
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT submission_id FROM replies WHERE id=?", (reply_id,)).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE replies SET verdict=?,classification_confidence='manual',"
+                " classification_reason='用户手动确认' WHERE id=?",
+                (verdict, reply_id))
+            if row["submission_id"] is not None and verdict in {"过稿", "退稿", "需修改"}:
+                self._conn.execute(
+                    "UPDATE submissions SET reply_status=?,replied_at=? WHERE id=?",
+                    (verdict, _now(), row["submission_id"]))
+            return True
 
     def mark_read(self, reply_id: int):
         with self._lock, self._conn:

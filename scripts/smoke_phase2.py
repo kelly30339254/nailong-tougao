@@ -114,6 +114,33 @@ check("移出小黑屋后恢复", editors_page.table.rowCount() == 2)
 from app.pages.editors import EMAIL_RE
 check("邮箱正则校验", EMAIL_RE.match("ed1@x.com") and not EMAIL_RE.match("not-an-email"))
 
+# 分页：插入 60 条凑成 62 条（2 页：50 + 12），验证后清理干净
+from app.pages.editors import PAGE_SIZE
+bulk_ids = [db.insert_editor(Editor(name=f"批量编辑{i:02d}", platform="平台B",
+                                    email=f"bulk{i}@x.com", genres="科幻"))
+            for i in range(60)]
+editors_page.refresh()
+check("分页后首页只渲染 50 行", editors_page.table.rowCount() == PAGE_SIZE
+      and PAGE_SIZE == 50)
+check("分页文案 第 1 / 2 页（共 62 人）",
+      editors_page.page_label.text() == "第 1 / 2 页（共 62 人）")
+check("首页上一页禁用、下一页可用",
+      not editors_page.prev_btn.isEnabled() and editors_page.next_btn.isEnabled())
+editors_page._goto_page(1)
+check("第二页 12 行", editors_page.table.rowCount() == 12)
+check("第二页下一页禁用、上一页可用",
+      not editors_page.next_btn.isEnabled() and editors_page.prev_btn.isEnabled())
+editors_page._goto_page(99)  # 越界应被夹到末页
+check("页码越界自动夹到末页", editors_page._page == 1
+      and editors_page.table.rowCount() == 12)
+editors_page._on_filter_changed()  # 模拟筛选变化
+check("筛选变化回到第一页", editors_page._page == 0
+      and editors_page.table.rowCount() == PAGE_SIZE)
+for bid in bulk_ids:
+    db.delete_editor(bid)
+editors_page.refresh()
+check("清理批量数据后恢复 2 行", editors_page.table.rowCount() == 2)
+
 # 导出 CSV → 导入往返
 csv_path = os.path.join(_tmp, "export.csv")
 editors = editors_page._current_editors()
