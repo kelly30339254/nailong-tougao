@@ -6,7 +6,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton,
     QTableWidget, QTableWidgetItem, QFrame, QDialog, QMessageBox, QInputDialog,
-    QAbstractItemView, QHeaderView, QPlainTextEdit,
+    QAbstractItemView, QHeaderView, QPlainTextEdit, QComboBox,
 )
 
 from ..theme import theme_colors
@@ -69,10 +69,21 @@ class RepliesPage(QWidget):
         self.unread_check = QCheckBox("只看未读")
         self.unread_check.toggled.connect(self._reload)
         top.addWidget(self.unread_check)
+        self.verdict_combo = QComboBox()
+        self.verdict_combo.addItems(["全部判定", "过稿", "退稿", "需修改", "待确认", "自动回复", "其他"])
+        self.verdict_combo.currentIndexChanged.connect(self._reload)
+        top.addWidget(self.verdict_combo)
+        self.mark_all_btn = QPushButton("全部标已读")
+        self.mark_all_btn.clicked.connect(self._on_mark_all_read)
+        top.addWidget(self.mark_all_btn)
         self.fetch_btn = QPushButton("立即收信")
         self.fetch_btn.setObjectName("primaryBtn")
         self.fetch_btn.clicked.connect(self._on_fetch)
         top.addWidget(self.fetch_btn)
+        self.stop_fetch_btn = QPushButton("停止收信")
+        self.stop_fetch_btn.setEnabled(False)
+        self.stop_fetch_btn.clicked.connect(self._on_stop_fetch)
+        top.addWidget(self.stop_fetch_btn)
         layout.addLayout(top)
 
         self.status_label = QLabel("")
@@ -103,6 +114,9 @@ class RepliesPage(QWidget):
 
     def _reload(self):
         replies = self.db.list_replies(unread_only=self.unread_check.isChecked())
+        verdict_filter = self.verdict_combo.currentText()
+        if verdict_filter != "全部判定":
+            replies = [r for r in replies if r.verdict == verdict_filter]
         editors = {e.email.lower(): e for e in self.db.list_editors(include_blacklisted=True)
                    if e.email}
         primary = QColor(theme_colors(self.store.get_theme())["primary"])
@@ -151,11 +165,11 @@ class RepliesPage(QWidget):
                 read_btn.setObjectName("iconBtn")
                 read_btn.clicked.connect(lambda _=False, rid=r.id: self._on_mark_read(rid))
                 ops_layout.addWidget(read_btn)
-            if r.verdict == "待确认":
-                confirm_btn = QPushButton("确认判定")
-                confirm_btn.setObjectName("iconBtn")
-                confirm_btn.clicked.connect(lambda _=False, rep=r: self._on_confirm(rep))
-                ops_layout.addWidget(confirm_btn)
+            # 所有回信都可人工改判（自动判定/自动回复同样可纠正）
+            confirm_btn = QPushButton("确认判定" if r.verdict == "待确认" else "改判")
+            confirm_btn.setObjectName("iconBtn")
+            confirm_btn.clicked.connect(lambda _=False, rep=r: self._on_confirm(rep))
+            ops_layout.addWidget(confirm_btn)
             view_btn = QPushButton("查看全文")
             view_btn.setObjectName("iconBtn")
             view_btn.clicked.connect(lambda _=False, rep=r: self._on_view(rep))
@@ -165,7 +179,7 @@ class RepliesPage(QWidget):
     def _on_confirm(self, reply):
         verdict, ok = QInputDialog.getItem(
             self, "确认回信判定", "请选择实际结果：",
-            ["过稿", "退稿", "需修改", "其他"], 0, False)
+            ["过稿", "退稿", "需修改", "其他", "自动回复"], 0, False)
         if not ok:
             return
         if not self.db.confirm_reply_verdict(reply.id, verdict):
@@ -180,6 +194,15 @@ class RepliesPage(QWidget):
 
     def _on_mark_read(self, reply_id: int):
         self.db.mark_read(reply_id)
+        self.main_window.data_changed.emit()
+        self._reload()
+
+    def _on_mark_all_read(self):
+        unread = self.db.list_replies(unread_only=True)
+        if not unread:
+            return
+        for r in unread:
+            self.db.mark_read(r.id)
         self.main_window.data_changed.emit()
         self._reload()
 
@@ -206,6 +229,7 @@ class RepliesPage(QWidget):
         self._fetch_failures: list[tuple[str, str]] = []
         self.fetch_btn.setEnabled(False)
         self.fetch_btn.setText("收信中…")
+        self.stop_fetch_btn.setEnabled(True)
         self.status_label.setText("")
         self._fetch_worker = FetchWorker(mailboxes, editor_emails, lookback_days, self)
         self._fetch_worker.progress.connect(lambda msg: self.status_label.setText(msg))
@@ -213,6 +237,12 @@ class RepliesPage(QWidget):
         self._fetch_worker.mailbox_failed.connect(self._on_mailbox_failed)
         self._fetch_worker.all_done.connect(self._on_fetch_done)
         self._fetch_worker.start()
+
+    def _on_stop_fetch(self):
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            self._fetch_worker.stop()
+            self.stop_fetch_btn.setEnabled(False)
+            self.status_label.setText("正在停止收信……")
 
     def _on_mailbox_failed(self, address: str, error: str):
         self._fetch_failures.append((address, error))
@@ -226,6 +256,7 @@ class RepliesPage(QWidget):
         self._fetch_worker = None
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("立即收信")
+        self.stop_fetch_btn.setEnabled(False)
         text = f"本次新到 {self._new_count} 封"
         if self._invalid_count:
             text += f"，标记失效邮箱 {self._invalid_count} 个"

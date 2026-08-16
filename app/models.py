@@ -45,12 +45,13 @@ class Submission:
     to_email: str = ""
     subject: str = ""
     body: str = ""
-    status: str = "待发"          # 待发 / 已发 / 失败 / 定时待发
+    status: str = "待发"          # 待发 / 已发 / 发送中 / 已跳过 / 失败 / 定时待发
     reply_status: str = "无"      # 无 / 过稿 / 退稿 / 需修改
     sent_at: str = ""
     replied_at: str = ""
     scheduled_at: str = ""
     message_id: str = ""
+    last_error: str = ""          # 最近一次失败原因（发送失败/跳过原因）
 
 
 @dataclass

@@ -66,6 +66,15 @@ class SettingsStore:
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value))
 
+    def _safe_int(self, key: str, default: int) -> int:
+        """读取整数设置；脏数据（非数字）回写默认值，避免启动/设置页崩溃。"""
+        try:
+            value = int(self.get(key, str(default)) or str(default))
+        except (TypeError, ValueError):
+            value = default
+            self.set(key, str(default))
+        return value
+
     # ---------- 邮箱 ----------
     def load_mailboxes(self) -> list[MailboxConfig]:
         """按 mailbox_count（默认 6）返回 MailboxConfig，不足补默认空配置。"""
@@ -142,19 +151,21 @@ class SettingsStore:
     def get_strategy(self) -> tuple[bool, int, int]:
         """返回 (one_draft_protection, interval_seconds, daily_limit)。"""
         one_draft = self.get("strategy_one_draft", "1") == "1"
-        interval = int(self.get("strategy_interval", "45") or "45")
-        daily = int(self.get("strategy_daily_limit", "30") or "30")
+        interval = self._safe_int("strategy_interval", 45)
+        daily = self._safe_int("strategy_daily_limit", 30)
         return one_draft, interval, daily
 
-    def save_strategy(self, one_draft_protection: bool, interval_seconds: int, daily_limit: int):
+    def save_strategy(self, one_draft_protection: bool, interval_seconds: int,
+                      daily_limit: int | None = None):
         self.set("strategy_one_draft", "1" if one_draft_protection else "0")
         self.set("strategy_interval", str(interval_seconds))
-        self.set("strategy_daily_limit", str(daily_limit))
+        if daily_limit is not None:
+            self.set("strategy_daily_limit", str(daily_limit))
 
     # ---------- 催稿提醒 ----------
     def get_urge_days(self) -> int:
         """催稿提醒天数，默认 30。"""
-        return int(self.get("urge_days", "30") or "30")
+        return self._safe_int("urge_days", 30)
 
     def save_urge_days(self, days: int):
         self.set("urge_days", str(days))
@@ -174,8 +185,8 @@ class SettingsStore:
     def get_fetch_config(self) -> tuple[bool, int, int]:
         """返回 (auto_fetch, interval_minutes, lookback_days)。"""
         auto = self.get("fetch_auto", "1") == "1"
-        interval = int(self.get("fetch_interval_minutes", "30") or "30")
-        lookback = int(self.get("fetch_lookback_days", "45") or "45")
+        interval = self._safe_int("fetch_interval_minutes", 30)
+        lookback = self._safe_int("fetch_lookback_days", 45)
         return auto, interval, lookback
 
     def save_fetch_config(self, auto_fetch: bool, interval_minutes: int, lookback_days: int):

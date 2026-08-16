@@ -6,13 +6,13 @@ import io
 import os
 import re
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QDesktopServices, QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QFrame,
     QDialog, QFormLayout, QFileDialog, QMessageBox, QAbstractItemView,
-    QHeaderView,
+    QHeaderView, QMenu,
 )
 
 from ..models import Editor
@@ -46,7 +46,7 @@ class EditorDialog(QDialog):
 
     def __init__(self, parent=None, editor: Editor | None = None):
         super().__init__(parent)
-        self.setWindowTitle("编辑编辑" if editor and editor.id else "新增编辑")
+        self.setWindowTitle("编辑编辑信息" if editor and editor.id else "新增编辑")
         self.setMinimumWidth(420)
         self.editor = editor or Editor()
 
@@ -124,54 +124,63 @@ class EditorsPage(QWidget):
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(10)
 
-        # 工具行
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        # 工具行：筛选行 + 操作行（避免 11 个控件挤在一行）
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索编辑 / 平台 / 邮箱 / 题材…")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self.search_edit, 2)
+        # 防抖：停止输入 200ms 后才重建表格，避免每敲一键全量刷新
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(200)
+        self._search_debounce.timeout.connect(self._on_filter_changed)
+        self.search_edit.textChanged.connect(lambda *_a: self._search_debounce.start())
+        filter_row.addWidget(self.search_edit, 2)
 
         self.platform_combo = QComboBox()
         self.platform_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self.platform_combo)
+        filter_row.addWidget(self.platform_combo)
         self.genre_combo = QComboBox()
         self.genre_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self.genre_combo)
+        filter_row.addWidget(self.genre_combo)
         self.direction_combo = QComboBox()
         self.direction_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self.direction_combo)
+        filter_row.addWidget(self.direction_combo)
         self.blacklist_combo = QComboBox()
         self.blacklist_combo.addItems(["正常编辑", "小黑屋", "全部编辑"])
         self.blacklist_combo.setToolTip("查看正常编辑、小黑屋编辑，或全部编辑")
         self.blacklist_combo.currentIndexChanged.connect(self._on_filter_changed)
-        toolbar.addWidget(self.blacklist_combo)
+        filter_row.addWidget(self.blacklist_combo)
         self.fav_check = QCheckBox("只看收藏")
         self.fav_check.toggled.connect(self._on_filter_changed)
-        toolbar.addWidget(self.fav_check)
+        filter_row.addWidget(self.fav_check)
         self.accepting_check = QCheckBox("只看正在收稿")
         self.accepting_check.setToolTip("仅显示状态为“正常收稿”的编辑")
         self.accepting_check.toggled.connect(self._on_filter_changed)
-        toolbar.addWidget(self.accepting_check)
-        toolbar.addStretch(1)
+        filter_row.addWidget(self.accepting_check)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
 
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addStretch(1)
         self.sync_btn = QPushButton("同步最新编辑")
         self.sync_btn.setObjectName("primaryBtn")
         self.sync_btn.setToolTip("从云端下载最新编辑信息（含收稿方向/状态），更新本地列表")
         self.sync_btn.clicked.connect(self._on_sync)
-        toolbar.addWidget(self.sync_btn)
+        action_row.addWidget(self.sync_btn)
         import_btn = QPushButton("导入")
         import_btn.clicked.connect(self._on_import)
-        toolbar.addWidget(import_btn)
+        action_row.addWidget(import_btn)
         export_btn = QPushButton("导出CSV")
         export_btn.clicked.connect(self._on_export)
-        toolbar.addWidget(export_btn)
+        action_row.addWidget(export_btn)
         add_btn = QPushButton("新增")
         add_btn.setObjectName("primaryBtn")
         add_btn.clicked.connect(self._on_add)
-        toolbar.addWidget(add_btn)
-        layout.addLayout(toolbar)
+        action_row.addWidget(add_btn)
+        layout.addLayout(action_row)
 
         # 提示条
         info = QFrame()
@@ -251,7 +260,9 @@ class EditorsPage(QWidget):
         elif blacklist_mode == "小黑屋":
             editors = [e for e in editors if e.blacklisted]
         if self.accepting_check.isChecked():
-            editors = [e for e in editors if (e.status or "").strip() == "正常收稿"]
+            # 容错：状态是自由文本，"正常收稿（长期）"等变体也应命中
+            editors = [e for e in editors
+                       if (e.status or "").strip().startswith("正常收稿")]
         return editors
 
     def refresh(self):
@@ -322,8 +333,10 @@ class EditorsPage(QWidget):
             return
 
         self.table.setRowCount(len(editors))
+        self._row_editors: list = []
         star_color = theme_colors(self.store.get_theme())["primary"]
         for row, e in enumerate(editors):
+            self._row_editors.append(e)
             # 收藏星标（SVG 图标按钮，实心=已收藏，描边灰=未收藏）
             fav_btn = QPushButton()
             fav_btn.setObjectName("iconBtn")
@@ -354,9 +367,9 @@ class EditorsPage(QWidget):
             # 收稿状态
             status_text = e.status or ""
             status_item = mk_item(status_text)
-            if status_text == "停止收稿":
+            if status_text.startswith("停止收稿"):
                 status_item.setForeground(Qt.red)
-            elif status_text == "正常收稿":
+            elif status_text.startswith("正常收稿"):
                 status_item.setForeground(QColor("#2F9E44"))
             status_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 6, status_item)
@@ -404,7 +417,28 @@ class EditorsPage(QWidget):
             ops_layout.addWidget(del_btn)
             self.table.setCellWidget(row, 10, ops)
 
-        self._fit_text_columns(editors)
+        # 列宽按全量（非当前页）测量：翻页/切筛选时列宽不再跳动
+        self._fit_text_columns(all_editors)
+
+        # 右键菜单：收藏 / 小黑屋 / 编辑 / 删除
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+
+    def _on_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0 or row >= len(self._row_editors):
+            return
+        e = self._row_editors[row]
+        menu = QMenu(self)
+        menu.addAction("取消收藏" if e.favorite else "收藏",
+                       lambda: self._toggle_fav(e.id))
+        menu.addAction("移出小黑屋" if e.blacklisted else "加入小黑屋",
+                       lambda: self._toggle_blacklist(e.id))
+        if e.email_invalid:
+            menu.addAction("恢复邮箱有效", lambda: self._on_restore_valid(e.id))
+        menu.addAction("编辑", lambda: self._on_edit(e))
+        menu.addAction("删除", lambda: self._on_delete(e))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _fit_text_columns(self, editors: list[Editor]):
         """按完整文本一次性计算列宽，兼顾不截字和大数据量性能。"""

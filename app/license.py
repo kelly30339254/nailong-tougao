@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 from .db import data_dir
@@ -97,6 +98,15 @@ def activate(card_key: str, url: str = ACTIVATE_URL,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read(64 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        # 服务器返回 4xx/5xx：读取响应体里的业务错误信息，别伪装成"网络问题"
+        detail = ""
+        try:
+            detail = exc.read(4 * 1024).decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        extra = f"（{detail.strip()}）" if detail.strip() else ""
+        return False, f"激活服务器返回错误（HTTP {exc.code}）{extra}"
     except Exception:
         return False, "无法连接激活服务器，请检查网络后重试"
     if len(raw) > 64 * 1024:

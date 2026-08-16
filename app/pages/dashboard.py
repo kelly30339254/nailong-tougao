@@ -15,11 +15,7 @@ from ..widgets import mk_item, make_dot
 from ..theme import theme_colors
 
 STAT_KEYS = ["编辑总数", "文稿", "待回复", "过稿", "退稿", "未读回信"]
-# db.counts() 返回的键 → 卡片标题映射
-_COUNT_KEY_MAP = {
-    "编辑总数": "编辑总数", "文稿": "文稿数", "待回复": "待回复",
-    "过稿": "过稿", "退稿": "退稿", "未读回信": "未读回信",
-}
+# 注意：卡片键与 db.counts() 仅"文稿"→"文稿数"一个差异，直接在 refresh 内映射，无冗余表
 
 
 def _relative_time(time_str: str) -> str:
@@ -158,23 +154,33 @@ class DashboardPage(QWidget):
         stats_layout.addWidget(self.stats_empty)
         layout.addWidget(stats_card)
 
-        # 后台自动收信定时器
         self._fetch_timer = QTimer(self)
         self._fetch_timer.timeout.connect(self._maybe_fetch)
-        auto_fetch, interval_minutes, _lookback = self.store.get_fetch_config()
-        if auto_fetch:
-            self._fetch_timer.start(interval_minutes * 60 * 1000)
+        self._fetch_config_key: tuple | None = None  # (auto, interval)，变化时重启定时器
 
         self.refresh()
 
     # ---------- 刷新 ----------
     def refresh(self):
         counts = self.db.counts()
-        for title, count_key in _COUNT_KEY_MAP.items():
-            self.stat_cards[title].set_value(counts.get(count_key, 0))
+        for key in STAT_KEYS:
+            count_key = "文稿数" if key == "文稿" else key
+            self.stat_cards[key].set_value(counts.get(count_key, 0))
         self._refresh_guide()
         self._refresh_activity()
         self._refresh_stats()
+        self._sync_fetch_timer()
+
+    def _sync_fetch_timer(self):
+        """收信设置变化后重启后台自动收信定时器（此前改配置不生效需重启应用）。"""
+        auto_fetch, interval_minutes, _lookback = self.store.get_fetch_config()
+        key = (bool(auto_fetch), int(interval_minutes))
+        if key == self._fetch_config_key:
+            return
+        self._fetch_config_key = key
+        self._fetch_timer.stop()
+        if auto_fetch and interval_minutes > 0:
+            self._fetch_timer.start(interval_minutes * 60 * 1000)
 
     def _clear_box(self, box: QVBoxLayout):
         while box.count():
@@ -247,6 +253,17 @@ class DashboardPage(QWidget):
             wrap = QWidget()
             wrap.setLayout(row)
             self.activity_box.addWidget(wrap)
+        # 超过一屏时提供"查看全部"入口（投递记录页含完整筛选）
+        more_btn = QPushButton("查看全部 →")
+        more_btn.setObjectName("iconBtn")
+        more_btn.setCursor(Qt.PointingHandCursor)
+        more_btn.clicked.connect(lambda: self.main_window.navigate("records"))
+        more_row = QHBoxLayout()
+        more_row.addStretch()
+        more_row.addWidget(more_btn)
+        more_wrap = QWidget()
+        more_wrap.setLayout(more_row)
+        self.activity_box.addWidget(more_wrap)
 
     # ---------- 数据统计 ----------
     def _refresh_stats(self):
@@ -288,6 +305,10 @@ class DashboardPage(QWidget):
             wrap = QWidget()
             wrap.setLayout(row)
             self.overview_box.addWidget(wrap)
+        if len(stats) > 8:
+            note = QLabel("表格仅显示投递最多的 8 个平台，上方合计为全部平台")
+            note.setObjectName("hintText")
+            self.overview_box.addWidget(note)
         self.overview_box.addStretch()
 
     # ---------- 后台自动收信 ----------
@@ -323,7 +344,10 @@ class DashboardPage(QWidget):
         failures = getattr(self, "_fetch_failures", [])
         if failures:
             addresses = "、".join(address for address, _error in failures)
-            self.main_window.statusBar().showMessage(
+            self.main_window.notify_status(
                 f"后台收信失败（{addresses}），请到回信中心查看邮箱配置。", 10000)
+        # 只发一次 data_changed（当前页刷新由 main_window 负责）；
+        # 若收信发生在后台（当前页不是工作台），则自行刷新工作台统计
         self.main_window.data_changed.emit()
-        self.refresh()
+        if self.main_window.stack.currentWidget() is not self:
+            self.refresh()

@@ -9,7 +9,8 @@ def mk_item(text: str, align=None) -> QTableWidgetItem:
     """带 tooltip 的 QTableWidgetItem：列宽不够时悬停可见完整文本。"""
     text = text or ""
     item = QTableWidgetItem(text)
-    item.setToolTip(text)
+    if text:
+        item.setToolTip(text)
     if align is not None:
         item.setTextAlignment(align)
     return item

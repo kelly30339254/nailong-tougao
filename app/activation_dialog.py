@@ -52,6 +52,13 @@ class ActivationDialog(QDialog):
         self.key_edit.setMaxLength(80)
         layout.addWidget(self.key_edit)
 
+        help_label = QLabel(
+            "提示：换电脑或重装系统后需要重新激活，原卡密无法再次使用，"
+            "请联系卖家提供重置支持。")
+        help_label.setObjectName("hintText")
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
         self.error_label = QLabel("")
         self.error_label.setObjectName("hintText")
         self.error_label.setWordWrap(True)

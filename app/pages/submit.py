@@ -388,7 +388,37 @@ class SubmitPage(QWidget):
         self._update_checked_label()
 
     def _update_checked_label(self):
-        self.checked_label.setText(f"已选: {len(self._checked_ids)} 家")
+        n = len(self._checked_ids)
+        extra = ""
+        if n:
+            # 实时预览将跳过数（与 _build_jobs 相同规则）：同平台重复 + 一稿一投
+            editors_by_id = {e.id: e for e in self.db.list_editors(include_blacklisted=True)}
+            manuscript_id = self._current_manuscript_id()
+            one_draft, _interval, _daily = self.store.get_strategy()
+            protect = bool(one_draft and manuscript_id is not None)
+            seen_platforms: set[str] = set()
+            skip_dup = skip_protect = 0
+            for editor_id in sorted(self._checked_ids):
+                editor = editors_by_id.get(editor_id)
+                if editor is None or editor.blacklisted or editor.email_invalid:
+                    skip_dup += 1
+                    continue
+                platform = (editor.platform or "").strip()
+                if platform and platform in seen_platforms:
+                    skip_dup += 1
+                    continue
+                if platform:
+                    seen_platforms.add(platform)
+                if protect and self.db.find_pending(manuscript_id, editor_id) is not None:
+                    skip_protect += 1
+            parts = []
+            if skip_dup:
+                parts.append(f"同平台将跳过 {skip_dup} 家")
+            if skip_protect:
+                parts.append(f"一稿一投将跳过 {skip_protect} 家")
+            if parts:
+                extra = f"（{'，'.join(parts)}）"
+        self.checked_label.setText(f"已选: {n} 家{extra}")
 
     def _on_select_all(self, checked: bool):
         for e in self._current_editors:
@@ -497,6 +527,8 @@ class SubmitPage(QWidget):
         """逐编辑原子建任务，并保存该编辑实际收到的个性化内容。"""
         one_draft, _interval, _daily = self.store.get_strategy()
         manuscript_id = self._current_manuscript_id()
+        if one_draft and not manuscript_id:
+            self._log("提示：未关联文稿，本次一稿一投保护未生效（同一编辑可重复投递）。")
         attachment = self._current_attachment() or None
         base_subject = self.subject_edit.text().strip()
         base_body = self.body_edit.toPlainText().strip()
@@ -591,14 +623,22 @@ class SubmitPage(QWidget):
         self.progress_bar.setValue(current)
         self._log(message)
 
-    def _on_item_done(self, submission_id: int, ok: bool, error: str, mailbox_address: str):
+    def _on_item_done(self, submission_id: int, ok: bool, error: str,
+                      mailbox_address: str, skipped: bool = False):
         if submission_id > 0:
-            self.db.update_status(submission_id, "已发" if ok else "失败")
-            if mailbox_address:
-                self.db.update_from_mailbox(submission_id, mailbox_address)
+            if skipped:
+                # 跳过（额度/状态变化）≠ 失败：不污染失败统计，保留可重试
+                self.db.update_status(submission_id, "已跳过", sent_at="")
+                self._skipped += 1
+            else:
+                self.db.update_status(
+                    submission_id, "已发" if ok else "失败",
+                    error=error if not ok else None)
+                if mailbox_address:
+                    self.db.update_from_mailbox(submission_id, mailbox_address)
         if ok:
             self._success += 1
-        else:
+        elif not skipped:
             self._failed += 1
             self._log(f"发送失败（{mailbox_address}）：{error}")
 

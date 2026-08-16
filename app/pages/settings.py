@@ -311,11 +311,6 @@ class SettingsPage(QWidget):
         self.interval_spin.setValue(45)
         self.interval_spin.setSuffix(" 秒")
         form.addRow("每封间隔", self.interval_spin)
-        self.daily_limit_spin = QSpinBox()
-        self.daily_limit_spin.setRange(1, 500)
-        self.daily_limit_spin.setValue(30)
-        self.daily_limit_spin.setSuffix(" 封")
-        form.addRow("每日上限", self.daily_limit_spin)
         self.urge_days_spin = QSpinBox()
         self.urge_days_spin.setRange(7, 180)
         self.urge_days_spin.setValue(30)
@@ -569,7 +564,6 @@ class SettingsPage(QWidget):
             self.letter_body_edit.textChanged,
             self.one_draft_check.toggled,
             self.interval_spin.valueChanged,
-            self.daily_limit_spin.valueChanged,
             self.urge_days_spin.valueChanged,
             self.auto_fetch_check.toggled,
             self.fetch_interval_spin.valueChanged,
@@ -620,10 +614,9 @@ class SettingsPage(QWidget):
         self.letter_subject_edit.setText(subject_tpl)
         self.letter_body_edit.setPlainText(body_tpl)
         # 策略
-        one_draft, interval, daily = self.store.get_strategy()
+        one_draft, interval, _daily = self.store.get_strategy()
         self.one_draft_check.setChecked(one_draft)
         self.interval_spin.setValue(interval)
-        self.daily_limit_spin.setValue(daily)
         self.urge_days_spin.setValue(self.store.get_urge_days())
         # 收信
         auto, fetch_interval, lookback = self.store.get_fetch_config()
@@ -642,9 +635,9 @@ class SettingsPage(QWidget):
         self.store.save_mailbox_count(len(self.mailbox_cards))
         self.store.save_letter_template(self.letter_subject_edit.text(),
                                         self.letter_body_edit.toPlainText())
+        # 每日上限以各邮箱卡片「单日上限」为准，此处不再提供全局死配置
         self.store.save_strategy(self.one_draft_check.isChecked(),
-                                 self.interval_spin.value(),
-                                 self.daily_limit_spin.value())
+                                 self.interval_spin.value())
         self.store.save_urge_days(self.urge_days_spin.value())
         self.store.save_fetch_config(self.auto_fetch_check.isChecked(),
                                      self.fetch_interval_spin.value(),

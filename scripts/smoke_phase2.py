@@ -7,6 +7,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 
 _tmp = tempfile.mkdtemp(prefix="nailong_smoke2_")
 os.environ["NAILONG_DATA_DIR"] = _tmp
@@ -78,11 +79,17 @@ check("普通文本列完整自适应且收稿方向固定窄列",
               for row in range(editors_page.table.rowCount())
               for col in (1, 2, 3, 4, 7)))
 
-# 搜索过滤
+# 搜索过滤（搜索框有 200ms 防抖，需等待定时器触发后断言）
 editors_page.search_edit.setText("张三")
+qapp.processEvents()
+time.sleep(0.25)
+qapp.processEvents()
 check("搜索过滤", editors_page.table.rowCount() == 1
       and editors_page.table.item(0, 1).text() == "张三编辑")
 editors_page.search_edit.setText("")
+qapp.processEvents()
+time.sleep(0.25)
+qapp.processEvents()
 # 只看收藏
 editors_page.fav_check.setChecked(True)
 check("只看收藏", editors_page.table.rowCount() == 1

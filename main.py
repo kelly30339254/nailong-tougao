@@ -18,11 +18,14 @@ from app.main_window import MainWindow, NAV_ITEMS
 def _make_window():
     db = Database()
     store = SettingsStore(db)
+    # 回收崩溃残留的「发送中」（超过 30 分钟回退为待发，释放日额度与一稿一投）
+    recovered = db.recover_stuck_sending()
+    if recovered:
+        print(f"已回收 {recovered} 条中断的发送中记录")
     from app.theme import resource_path
     seed_path = resource_path(os.path.join("app", "data", "builtin_editors.json"))
-    # 启动自检：编辑表为空（如被清空过）则清标记重新播种
-    if db.counts()["编辑总数"] == 0:
-        db.clear_seed_marker()
+    # 仅首次（无 builtin_seeded 标记）播种内置编辑；
+    # 用户清空编辑列表后重启不会重新灌入
     inserted, _skipped = db.seed_builtin_editors(seed_path)
     if inserted:
         print(f"已导入内置编辑 {inserted} 位")
@@ -51,6 +54,17 @@ def main():
     if os.environ.get("NAILONG_SMOKE") == "1":
         sys.exit(smoke())
 
+    # 单实例保护：双开第二个实例直接提示退出，避免争用数据库报 database is locked
+    from PySide6.QtCore import QLockFile
+    from app.db import data_dir
+    lock = QLockFile(os.path.join(data_dir(), "app.lock"))
+    lock.setStaleLockTime(5000)
+    if not lock.tryLock(100):
+        app = QApplication(sys.argv)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(None, "奶龙投稿助手", "程序已在运行，请勿重复打开。")
+        sys.exit(1)
+
     app = QApplication(sys.argv)
     app.setApplicationName("奶龙投稿助手")
     if not lic.is_activated():
@@ -59,7 +73,12 @@ def main():
             sys.exit(0)
     window = _make_window()
     window.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    try:
+        window.db.close()
+    except Exception:
+        pass
+    sys.exit(code)
 
 
 if __name__ == "__main__":

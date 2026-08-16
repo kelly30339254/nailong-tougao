@@ -279,7 +279,7 @@ tab_texts = [submit_page.tab_bar.tabText(i) for i in range(submit_page.tab_bar.c
 check("无随机推荐标签", "随机推荐" not in tab_texts and tab_texts == ["全部编辑", "收藏分类"])
 settings_page = win._pages["settings"]
 settings_tabs = [settings_page.tabs.tabText(i) for i in range(settings_page.tabs.count())]
-check("设置页 6 个标签无作者与落款", len(settings_tabs) == 6
+check("设置页 7 个标签无作者与落款", len(settings_tabs) == 7
       and "作者与落款" not in settings_tabs
       and "投稿信模板" in settings_tabs and "数据备份" in settings_tabs)
 check("侧栏无分组标签", len(win.findChildren(QLabel, "navGroupLabel")) == 0)
@@ -296,6 +296,16 @@ tutorial_dialog.close()
 check("表格单元格带 tooltip", win._pages["editors"].table.item(0, 1).toolTip()
       == win._pages["editors"].table.item(0, 1).text())
 check("文稿下拉项带 tooltip", submit_page.manuscript_combo.count() >= 1)
+
+# 显式释放 Qt 对象（tutorial 对话框/查看全文对话框/主窗口），
+# 避免解释器退出时析构顺序不定导致的 offscreen 原生崩溃
+for widget in (tutorial_dialog, dlg):
+    widget.setParent(None)
+    widget.deleteLater()
+win.close()
+win.deleteLater()
+for _ in range(3):
+    qapp.processEvents()
 
 print()
 print(f"全部通过：{sum(RESULTS)}/{len(RESULTS)} 项")

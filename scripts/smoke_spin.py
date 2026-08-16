@@ -61,7 +61,6 @@ def click_spin(spin: QSpinBox, up: bool):
 
 
 for name, spin in (("每封间隔", settings_page.interval_spin),
-                   ("每日上限", settings_page.daily_limit_spin),
                    ("催稿提醒", settings_page.urge_days_spin)):
     up_rect = click_spin(spin, True)
     down_rect = click_spin(spin, False)

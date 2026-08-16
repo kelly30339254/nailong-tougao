@@ -4,11 +4,12 @@ from __future__ import annotations
 import os
 import shutil
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QDialog, QFormLayout,
-    QFileDialog, QMessageBox, QAbstractItemView, QHeaderView,
+    QFileDialog, QMessageBox, QAbstractItemView, QHeaderView, QMenu,
 )
 
 from ..models import Manuscript
@@ -103,6 +104,10 @@ class ManuscriptDialog(QDialog):
         file_wrap = QWidget()
         file_wrap.setLayout(file_row)
         form.addRow("关联文件", file_wrap)
+        copy_hint = QLabel("所选文件会被复制到软件数据目录；之后修改原文件不会同步，需重新选择。")
+        copy_hint.setObjectName("hintText")
+        copy_hint.setWordWrap(True)
+        form.addRow("", copy_hint)
 
         layout.addLayout(form)
 
@@ -121,13 +126,15 @@ class ManuscriptDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "选择文稿文件", "", FILE_FILTER)
         if not path:
             return
+        # 先读源文件统计字数，成功后才复制进数据目录（避免失败留下孤儿副本）
         try:
-            self.file_path = copy_to_files_dir(self.db.files_dir, path)
-            text = read_manuscript_text(self.file_path)
-            self.words_edit.setText(str(count_cjk_words(text)))
+            text = read_manuscript_text(path)
+            words = count_cjk_words(text)
         except Exception as exc:
             QMessageBox.warning(self, "读取失败", f"无法读取文件：{exc}")
             return
+        self.file_path = copy_to_files_dir(self.db.files_dir, path)
+        self.words_edit.setText(str(words))
         self.file_label.setText(os.path.basename(self.file_path))
 
     def _on_save(self):
@@ -161,9 +168,13 @@ class ManuscriptsPage(QWidget):
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(10)
 
-        # 顶部
+        # 顶部：搜索 + 操作
         top = QHBoxLayout()
-        top.addStretch()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索标题 / 分类 / 类型…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(lambda *_a: self.refresh())
+        top.addWidget(self.search_edit, 1)
         upload_btn = QPushButton("上传 txt/docx")
         upload_btn.clicked.connect(self._on_upload)
         top.addWidget(upload_btn)
@@ -195,11 +206,18 @@ class ManuscriptsPage(QWidget):
 
     def refresh(self):
         manuscripts = self.db.list_manuscripts()
+        keyword = self.search_edit.text().strip().lower()
+        if keyword:
+            manuscripts = [m for m in manuscripts
+                           if keyword in (m.title or "").lower()
+                           or keyword in (m.category or "").lower()
+                           or keyword in (m.genre_type or "").lower()]
         # 文稿 → 最新一条售出记录
         sold_map: dict[int, object] = {}
         for s in self.db.list_sales():
             if s.manuscript_id not in sold_map:
                 sold_map[s.manuscript_id] = s
+        self._row_manuscripts: list = []
         self.table.setRowCount(0)
         if not manuscripts:
             self.table.setRowCount(1)
@@ -211,6 +229,7 @@ class ManuscriptsPage(QWidget):
 
         self.table.setRowCount(len(manuscripts))
         for row, m in enumerate(manuscripts):
+            self._row_manuscripts.append(m)
             self.table.setItem(row, 0, mk_item(m.title or ""))
             sale = sold_map.get(m.id)
             if sale is not None:
@@ -224,6 +243,9 @@ class ManuscriptsPage(QWidget):
                 self.table.setCellWidget(row, 1, badge_cell(
                     "已售", "pass",
                     tooltip=f"已售：{sale.platform} {sale.editor_name}{amount_text}{payment_text}"))
+            else:
+                # 未售出行也给出状态，而不是空白浪费一列
+                self.table.setCellWidget(row, 1, badge_cell("未售", "other"))
 
             values = [str(m.word_count or ""), m.category, m.reader_group,
                       m.emotion, m.style, m.genre_type, m.created_at]
@@ -234,6 +256,14 @@ class ManuscriptsPage(QWidget):
             ops_layout = QHBoxLayout(ops)
             ops_layout.setContentsMargins(2, 0, 2, 0)
             ops_layout.setSpacing(4)
+            if m.file_path:
+                open_btn = QPushButton("打开")
+                open_btn.setObjectName("iconBtn")
+                open_btn.setToolTip("打开文稿文件")
+                open_btn.clicked.connect(
+                    lambda _=False, fp=m.file_path: QDesktopServices.openUrl(
+                        QUrl.fromLocalFile(fp)))
+                ops_layout.addWidget(open_btn)
             edit_btn = QPushButton("编辑")
             edit_btn.setObjectName("iconBtn")
             edit_btn.clicked.connect(lambda _=False, mid=m.id: self._on_edit(mid))
@@ -249,6 +279,24 @@ class ManuscriptsPage(QWidget):
             del_btn.clicked.connect(lambda _=False, mm=m: self._on_delete(mm))
             ops_layout.addWidget(del_btn)
             self.table.setCellWidget(row, 9, ops)
+
+        # 右键菜单：打开 / 编辑 / 售出 / 删除
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+
+    def _on_context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0 or row >= len(self._row_manuscripts):
+            return
+        m = self._row_manuscripts[row]
+        menu = QMenu(self)
+        if m.file_path:
+            menu.addAction("打开文件", lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(m.file_path)))
+        menu.addAction("编辑", lambda: self._on_edit(m.id))
+        menu.addAction("登记售出", lambda: self._on_add_sale(m.id))
+        menu.addAction("删除", lambda: self._on_delete(m))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _on_add(self):
         dlg = ManuscriptDialog(self.db, self)
@@ -269,9 +317,7 @@ class ManuscriptsPage(QWidget):
             self.refresh()
 
     def _on_delete(self, manuscript: Manuscript):
-        extra = ""
-        if self.db.sales_for_manuscript(manuscript.id):
-            extra = "\n该文稿的售出记录将一并删除。"
+        extra = "\n该文稿的售出记录、投递记录与相关回信将一并删除。"
         ret = QMessageBox.question(self, "确认删除",
                                    f"确定删除文稿《{manuscript.title}》吗？{extra}")
         if ret == QMessageBox.Yes:
@@ -296,8 +342,9 @@ class ManuscriptsPage(QWidget):
         errors: list[str] = []
         for path in paths:
             try:
+                # 先读源文件，成功后再复制（失败不留下孤儿副本）
+                text = read_manuscript_text(path)
                 copied = copy_to_files_dir(self.db.files_dir, path)
-                text = read_manuscript_text(copied)
                 title = os.path.splitext(os.path.basename(path))[0]
                 self.db.insert_manuscript(Manuscript(
                     title=title, file_path=copied,

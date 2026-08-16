@@ -110,6 +110,9 @@ class Database:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
+            # WAL + busy_timeout：双实例/多线程并发写不再抛 database is locked
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.executescript(SCHEMA)
             self._migrate()
 
@@ -134,6 +137,9 @@ class Database:
         if "message_id" not in subs_cols:
             self._conn.execute(
                 "ALTER TABLE submissions ADD COLUMN message_id TEXT DEFAULT ''")
+        if "last_error" not in subs_cols:
+            self._conn.execute(
+                "ALTER TABLE submissions ADD COLUMN last_error TEXT DEFAULT ''")
         replies_cols = {r["name"] for r in
                         self._conn.execute("PRAGMA table_info(replies)").fetchall()}
         reply_columns = (
@@ -176,6 +182,21 @@ class Database:
             self._conn.execute(
                 "INSERT INTO settings(key, value) VALUES('source_cleared_v1', '1')"
                 " ON CONFLICT(key) DO UPDATE SET value='1'")
+        # 高频查询索引：投稿状态筛选/邮箱额度统计/回信关联去重
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_editor ON submissions(editor_id)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_manuscript ON submissions(manuscript_id)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_status_reply ON submissions(status, reply_status)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_mailbox_sent ON submissions(from_mailbox, sent_at)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_message_id ON submissions(message_id)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replies_submission ON replies(submission_id)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replies_dedupe ON replies(mailbox_address, imap_folder, message_id)")
 
     @property
     def files_dir(self) -> str:
@@ -302,6 +323,14 @@ class Database:
     def delete_editor(self, editor_id: int):
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM editors WHERE id=?", (editor_id,))
+            # 级联清理该编辑的投递记录与回信，避免幽灵数据污染统计
+            rows = self._conn.execute(
+                "SELECT id FROM submissions WHERE editor_id=?", (editor_id,)).fetchall()
+            if rows:
+                ids = [r["id"] for r in rows]
+                marks = ",".join("?" for _ in ids)
+                self._conn.execute(f"DELETE FROM replies WHERE submission_id IN ({marks})", ids)
+                self._conn.execute(f"DELETE FROM submissions WHERE id IN ({marks})", ids)
 
     def toggle_favorite(self, editor_id: int) -> bool:
         with self._lock, self._conn:
@@ -388,8 +417,15 @@ class Database:
     def delete_manuscript(self, manuscript_id: int):
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM manuscripts WHERE id=?", (manuscript_id,))
-            # 连带删除其售出记录
+            # 连带删除其售出记录与关联投递/回信，避免幽灵数据污染统计
             self._conn.execute("DELETE FROM sales WHERE manuscript_id=?", (manuscript_id,))
+            rows = self._conn.execute(
+                "SELECT id FROM submissions WHERE manuscript_id=?", (manuscript_id,)).fetchall()
+            if rows:
+                ids = [r["id"] for r in rows]
+                marks = ",".join("?" for _ in ids)
+                self._conn.execute(f"DELETE FROM replies WHERE submission_id IN ({marks})", ids)
+                self._conn.execute(f"DELETE FROM submissions WHERE id IN ({marks})", ids)
 
     # ---------- sales（稿费记录） ----------
     @staticmethod
@@ -454,7 +490,8 @@ class Database:
                           subject=r["subject"], body=r["body"], status=r["status"],
                           reply_status=r["reply_status"], sent_at=r["sent_at"],
                           replied_at=r["replied_at"], scheduled_at=r["scheduled_at"],
-                          message_id=r["message_id"])
+                          message_id=r["message_id"],
+                          last_error=r["last_error"] if "last_error" in r.keys() else "")
 
     def insert_submission(self, s: Submission) -> int:
         with self._lock, self._conn:
@@ -503,22 +540,39 @@ class Database:
                 " WHERE id=? AND status IN ('待发','定时待发')"
                 " AND (SELECT COUNT(*) FROM submissions"
                 " WHERE lower(from_mailbox)=lower(?)"
-                " AND status IN ('已发','发送中','发送结果未知')"
+                " AND status IN ('已发','发送中')"
                 " AND sent_at LIKE ?) < ?",
                 (mailbox_address, now, submission_id, mailbox_address, today,
                  daily_limit))
             return cur.rowcount == 1
 
-    def update_status(self, submission_id: int, status: str, sent_at: str | None = None):
+    def update_status(self, submission_id: int, status: str, sent_at: str | None = None,
+                      error: str | None = None):
         with self._lock, self._conn:
             if sent_at is None and status == "已发":
                 sent_at = _now()
             if sent_at is not None:
-                self._conn.execute("UPDATE submissions SET status=?, sent_at=? WHERE id=?",
-                                   (status, sent_at, submission_id))
+                self._conn.execute(
+                    "UPDATE submissions SET status=?, sent_at=?, last_error=? WHERE id=?",
+                    (status, sent_at, error or "", submission_id))
             else:
-                self._conn.execute("UPDATE submissions SET status=? WHERE id=?",
-                                   (status, submission_id))
+                self._conn.execute(
+                    "UPDATE submissions SET status=?, last_error=? WHERE id=?",
+                    (status, error or "", submission_id))
+
+    def recover_stuck_sending(self, minutes: int = 30) -> int:
+        """启动/定期调用：把卡在「发送中」超过 minutes 的记录回退为待发。
+
+        崩溃后残留的「发送中」会永久占用当日额度并堵死一稿一投，
+        此方法按 sent_at 超时判定回收，返回回收条数。
+        """
+        cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE submissions SET status='待发', sent_at=''"
+                " WHERE status='发送中' AND sent_at != '' AND sent_at < ?",
+                (cutoff,))
+            return cur.rowcount
 
     def update_reply_status(self, submission_id: int, reply_status: str):
         with self._lock, self._conn:
@@ -678,9 +732,9 @@ class Database:
                 src.close()
 
     def clear_business_data(self):
-        """清空文稿、投递记录、回信 3 张业务表；保留编辑列表与设置。"""
+        """清空文稿、投递记录、回信、稿费 4 张业务表；保留编辑列表与设置。"""
         with self._lock, self._conn:
-            for table in ("manuscripts", "submissions", "replies"):
+            for table in ("manuscripts", "submissions", "replies", "sales"):
                 self._conn.execute(f"DELETE FROM {table}")
 
     def list_submissions(self, status_filter: str | None = None) -> list[Submission]:
@@ -716,7 +770,8 @@ class Database:
                 rows = self._conn.execute(
                     f"SELECT * FROM submissions WHERE message_id IN ({marks})"
                     " AND lower(to_email)=lower(?)"
-                    " AND lower(from_mailbox)=lower(?)",
+                    " AND lower(from_mailbox)=lower(?)"
+                    " AND reply_status='无'",
                     message_ids + [from_email, mailbox_address]).fetchall()
                 if len(rows) == 1:
                     return self._row_to_submission(rows[0])
@@ -747,11 +802,12 @@ class Database:
         return r["c"]
 
     def count_today(self, mailbox_name: str) -> int:
-        """该邮箱今日已发数。"""
+        """该邮箱今日已发数（大小写不敏感，与 reserve_daily_send 口径一致）。"""
         today = date.today().strftime("%Y-%m-%d")
         with self._lock:
             r = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM submissions WHERE from_mailbox=? AND status='已发' AND sent_at LIKE ?",
+                "SELECT COUNT(*) AS c FROM submissions"
+                " WHERE lower(from_mailbox)=lower(?) AND status='已发' AND sent_at LIKE ?",
                 (mailbox_name, today + "%")).fetchone()
         return r["c"]
 
@@ -770,8 +826,16 @@ class Database:
                      received_at=r["received_at"])
 
     def insert_reply(self, r: Reply) -> int | None:
-        """按 imap_uid + from_email 去重，重复返回 None。"""
+        """按 message_id（首选）/ imap_uid 去重，重复返回 None。"""
         with self._lock, self._conn:
+            # message_id 稳定且不依赖 UIDVALIDITY：uid 为空或漂移时也能去重
+            if r.message_id:
+                dup = self._conn.execute(
+                    "SELECT id FROM replies WHERE lower(mailbox_address)=lower(?)"
+                    " AND imap_folder=? AND message_id=? LIMIT 1",
+                    (r.mailbox_address or "", r.imap_folder, r.message_id)).fetchone()
+                if dup:
+                    return None
             if r.imap_uid:
                 if r.mailbox_address:
                     dup = self._conn.execute(
@@ -806,8 +870,12 @@ class Database:
         return [self._row_to_reply(r) for r in rows]
 
     def confirm_reply_verdict(self, reply_id: int, verdict: str) -> bool:
-        """保存用户确认结果；有唯一投稿关联时同步更新投稿状态。"""
-        if verdict not in {"过稿", "退稿", "需修改", "其他"}:
+        """保存用户确认结果；有唯一投稿关联时同步更新投稿状态。
+
+        - 过稿/退稿/需修改：回写投稿状态
+        - 其他/自动回复：撤销此前自动回写（回到待回复），避免误判永久污染统计
+        """
+        if verdict not in {"过稿", "退稿", "需修改", "其他", "自动回复"}:
             raise ValueError("不支持的回信判定")
         with self._lock, self._conn:
             row = self._conn.execute(
@@ -818,10 +886,15 @@ class Database:
                 "UPDATE replies SET verdict=?,classification_confidence='manual',"
                 " classification_reason='用户手动确认' WHERE id=?",
                 (verdict, reply_id))
-            if row["submission_id"] is not None and verdict in {"过稿", "退稿", "需修改"}:
-                self._conn.execute(
-                    "UPDATE submissions SET reply_status=?,replied_at=? WHERE id=?",
-                    (verdict, _now(), row["submission_id"]))
+            if row["submission_id"] is not None:
+                if verdict in {"过稿", "退稿", "需修改"}:
+                    self._conn.execute(
+                        "UPDATE submissions SET reply_status=?,replied_at=? WHERE id=?",
+                        (verdict, _now(), row["submission_id"]))
+                else:
+                    self._conn.execute(
+                        "UPDATE submissions SET reply_status='无',replied_at='' WHERE id=?",
+                        (row["submission_id"],))
             return True
 
     def mark_read(self, reply_id: int):

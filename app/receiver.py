@@ -100,7 +100,8 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
         return results
 
     since = (datetime.now() - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
-    imap = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port)
+    # 显式传入 timeout：之前 _TIMEOUT 是死代码，IMAP 主机不可达时会永久阻塞
+    imap = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port, timeout=_TIMEOUT)
     try:
         imap.login(mailbox.address, mailbox.auth_code)
         imap.select("INBOX", readonly=True)
@@ -118,7 +119,9 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
         if typ != "OK" or not data or not data[0]:
             return results
         for num in data[0].split():
-            typ, msg_data = imap.fetch(num, "(UID RFC822)")
+            # BODY.PEEK：RFC3501 规定 BODY[] 会隐式置 \Seen 已读标记，
+            # 用 PEEK 才能真正做到"不修改邮箱中的已读状态"
+            typ, msg_data = imap.fetch(num, "(UID BODY.PEEK[])")
             if typ != "OK" or not msg_data or not msg_data[0]:
                 continue
             raw = msg_data[0][1]

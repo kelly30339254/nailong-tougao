@@ -1,7 +1,7 @@
 """主窗口：顶栏 + 侧栏导航 + QStackedWidget。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QUrl, QTimer
+from PySide6.QtCore import Qt, Signal, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
@@ -26,7 +26,7 @@ LINKS = [
      TUTORIAL_ACTION),
 ]
 
-# 拍平的 7 个导航项（无分组标题）
+# 拍平的 8 个导航项（无分组标题）
 NAV_ITEMS = [
     ("dashboard", "工作台"),
     ("submit", "发起投稿"),
@@ -40,53 +40,30 @@ NAV_ITEMS = [
 
 
 class PromoButton(QFrame):
-    """顶栏双行按钮：可打开外部链接或执行本地操作。"""
+    """顶栏按钮：可打开外部链接或执行本地操作（压缩为单行，副标题进 tooltip）。"""
 
     def __init__(self, title: str, subtitle: str, tooltip: str, url: str,
                  on_click=None, parent=None):
         super().__init__(parent)
         self.setObjectName("promoBtn")
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip(tooltip)
+        self.setToolTip(f"{title}：{subtitle}\n{tooltip}" if subtitle else tooltip)
         self._url = url
         self._on_click = on_click
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 6, 16, 6)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 2, 10, 2)
         layout.setSpacing(0)
         title_label = QLabel(title)
         title_label.setObjectName("promoTitle")
         title_label.setAlignment(Qt.AlignCenter)
         title_label.setAttribute(Qt.WA_TransparentForMouseEvents)
         layout.addWidget(title_label)
-        sub_label = QLabel(subtitle)
-        sub_label.setObjectName("promoSub")
-        sub_label.setAlignment(Qt.AlignCenter)
-        sub_label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        layout.addWidget(sub_label)
 
     def mousePressEvent(self, _event):
         if self._on_click is not None:
             self._on_click()
         elif self._url:
             QDesktopServices.openUrl(QUrl(self._url))
-
-
-class PlaceholderPage(QWidget):
-    """后续阶段实现的内容页占位。遵守页面契约：构造 (db, store, main_window) + refresh()。"""
-
-    def __init__(self, db, store, main_window, title: str = ""):
-        super().__init__()
-        self.db, self.store, self.main_window = db, store, main_window
-        layout = QVBoxLayout(self)
-        layout.addStretch()
-        label = QLabel(f"「{title}」页面建设中")
-        label.setAlignment(Qt.AlignCenter)
-        label.setObjectName("hintText")
-        layout.addWidget(label)
-        layout.addStretch()
-
-    def refresh(self):
-        pass
 
 
 class MainWindow(QMainWindow):
@@ -163,7 +140,7 @@ class MainWindow(QMainWindow):
         for name, subtitle, tooltip, url in LINKS:
             on_click = self._show_tutorial if url == TUTORIAL_ACTION else None
             promo = PromoButton(name, subtitle, tooltip, url, on_click, bar)
-            promo.setFixedHeight(40)
+            promo.setFixedHeight(30)
             layout.addWidget(promo, 0, Qt.AlignVCenter)
 
         layout.addStretch()
@@ -174,11 +151,15 @@ class MainWindow(QMainWindow):
         self.mail_badge.setToolTip("点击前往设置页配置邮箱")
         self.mail_badge.setFixedHeight(26)
         self.mail_badge.setAlignment(Qt.AlignCenter)
-        self.mail_badge.mousePressEvent = lambda _e: self.navigate("settings")
+        self.mail_badge.mousePressEvent = self._on_mail_badge_click
         layout.addWidget(self.mail_badge, 0, Qt.AlignVCenter)
         layout.addSpacing(6)
 
+        theme_label = QLabel("主题")
+        theme_label.setObjectName("hintText")
+        layout.addWidget(theme_label, 0, Qt.AlignVCenter)
         self.theme_combo = QComboBox()
+        self.theme_combo.setToolTip("切换主题色（自动保存）")
         self.theme_combo.addItems(list(THEMES.keys()))
         current = self.store.get_theme()
         self.theme_combo.setCurrentText(current if current in THEMES else DEFAULT_THEME)
@@ -191,7 +172,9 @@ class MainWindow(QMainWindow):
         return TutorialDialog(self)
 
     def _show_tutorial(self):
-        self._tutorial_dialog = self._create_tutorial_dialog()
+        # 复用同一对话框实例，避免每次点击累积未销毁的窗口
+        if getattr(self, "_tutorial_dialog", None) is None:
+            self._tutorial_dialog = self._create_tutorial_dialog()
         self._tutorial_dialog.exec()
 
     # ---------- 侧栏 ----------
@@ -213,7 +196,7 @@ class MainWindow(QMainWindow):
             self._nav_ids.append(page_id)
         layout.addWidget(self.nav_list, 1)
         self.nav_list.currentRowChanged.connect(self._on_nav_changed)
-        self.nav_list.setIconSize(self.nav_list.iconSize())
+        self.nav_list.setIconSize(QSize(18, 18))
         return bar
 
     def _refresh_nav_icons(self):
@@ -247,10 +230,7 @@ class MainWindow(QMainWindow):
             "sales": lambda: SalesPage(self.db, self.store, self),
         }
         for page_id, title in NAV_ITEMS:
-            if page_id in constructors:
-                page = constructors[page_id]()
-            else:
-                page = PlaceholderPage(self.db, self.store, self, title)
+            page = constructors[page_id]()
             self._pages[page_id] = page
             self.stack.addWidget(page)
 
@@ -273,6 +253,20 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self._nav_ids):
             self.navigate(self._nav_ids[row])
 
+    def keyPressEvent(self, event):
+        """快捷键：Ctrl+1..8 切页，F5 刷新当前页。"""
+        if event.modifiers() & Qt.ControlModifier:
+            idx = event.key() - Qt.Key_1
+            if 0 <= idx < len(NAV_ITEMS):
+                self.navigate(NAV_ITEMS[idx][0])
+                return
+        if event.key() == Qt.Key_F5:
+            current = self.stack.currentWidget()
+            if current is not None and hasattr(current, "refresh"):
+                current.refresh()
+            return
+        super().keyPressEvent(event)
+
     def _on_data_changed(self):
         current = self.stack.currentWidget()
         if current is not None and hasattr(current, "refresh"):
@@ -280,6 +274,19 @@ class MainWindow(QMainWindow):
         self.update_mail_badge()
 
     # ---------- 定时投稿调度 ----------
+    def notify_status(self, message: str, ms: int = 8000):
+        """主窗口状态栏提示，超时后自动隐藏（避免残留一条永远空的状态栏）。"""
+        bar = self.statusBar()
+        gen = getattr(self, "_status_gen", 0) + 1
+        self._status_gen = gen
+        bar.showMessage(message, ms)
+
+        def _hide():
+            if getattr(self, "_status_gen", 0) == gen:
+                bar.hide()
+
+        QTimer.singleShot(ms + 200, _hide)
+
     def _check_scheduled(self):
         from .workers import SendWorker
         if self._sched_worker is not None and self._sched_worker.isRunning():
@@ -304,20 +311,35 @@ class MainWindow(QMainWindow):
                          "subject": s.subject, "body": s.body,
                          "message_id": s.message_id,
                          "attachment_path": attachment})
+        self._sched_ok = self._sched_fail = self._sched_skip = 0
         self._sched_worker = SendWorker(mailboxes, jobs, interval, self, db=self.db)
         self._sched_worker.item_done.connect(self._on_sched_item_done)
         self._sched_worker.all_done.connect(self._on_sched_all_done)
         self._sched_worker.start()
 
     def _on_sched_item_done(self, submission_id: int, ok: bool, error: str,
-                            mailbox_address: str):
+                            mailbox_address: str, skipped: bool = False):
         if submission_id > 0:
-            self.db.update_status(submission_id, "已发" if ok else "失败")
-            if mailbox_address:
-                self.db.update_from_mailbox(submission_id, mailbox_address)
+            if skipped:
+                self.db.update_status(submission_id, "已跳过", sent_at="")
+                self._sched_skip += 1
+            else:
+                self.db.update_status(
+                    submission_id, "已发" if ok else "失败",
+                    error=error if not ok else None)
+                if mailbox_address:
+                    self.db.update_from_mailbox(submission_id, mailbox_address)
+                if ok:
+                    self._sched_ok += 1
+                else:
+                    self._sched_fail += 1
 
     def _on_sched_all_done(self):
         self._sched_worker = None
+        text = f"定时投稿完成：成功 {self._sched_ok}，失败 {self._sched_fail}"
+        if self._sched_skip:
+            text += f"，跳过 {self._sched_skip}"
+        self.notify_status(text, 10000)
         self.data_changed.emit()
 
     # ---------- 检查更新 ----------
@@ -333,6 +355,9 @@ class MainWindow(QMainWindow):
 
     def _on_update_result(self, info, error: str, manual: bool):
         self._update_worker = None
+        # 用户曾选择"忽略此版本"：即使服务器仍报该版本也不打扰
+        if info is not None and self.store.get("ignored_version") == info["version"]:
+            return
         if info is None:
             if manual:
                 if error:
@@ -341,6 +366,9 @@ class MainWindow(QMainWindow):
                 else:
                     QMessageBox.information(self, "检查更新",
                                             f"当前已是最新版本（{APP_VERSION}）")
+            elif error:
+                # 自动检查失败：弱提示，不弹窗打扰
+                self.notify_status("检查更新失败，请检查网络。", 6000)
             return
         box = QMessageBox(self)
         box.setWindowTitle("发现新版本")
@@ -351,12 +379,22 @@ class MainWindow(QMainWindow):
         download_btn = None
         if info.get("download_url"):
             download_btn = box.addButton("去下载", QMessageBox.AcceptRole)
+        ignore_btn = box.addButton("忽略此版本", QMessageBox.ActionRole)
         box.addButton("下次再说", QMessageBox.RejectRole)
         box.exec()
         if download_btn is not None and box.clickedButton() is download_btn:
             QDesktopServices.openUrl(QUrl(info["download_url"]))
+        elif box.clickedButton() is ignore_btn:
+            self.store.set("ignored_version", info["version"])
 
     # ---------- 顶栏状态 ----------
+    def _on_mail_badge_click(self, _event):
+        """点击邮箱徽章：跳转设置页并定位到「发信邮箱」标签（不再记住上次停留位置）。"""
+        self.navigate("settings")
+        settings_page = self._pages.get("settings")
+        if settings_page is not None and hasattr(settings_page, "tabs"):
+            settings_page.tabs.setCurrentIndex(0)
+
     def update_mail_badge(self):
         mailboxes = self.store.load_mailboxes()
         enabled = sum(1 for m in mailboxes if m.enabled and m.address)
