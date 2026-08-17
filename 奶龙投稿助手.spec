@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Qt6 / PySide6：务必关闭 UPX，否则 Windows 上易出现
 # 「DLL load failed while importing QtWidgets: 找不到指定的模块」
+import os
 import sys
 
 
@@ -18,6 +19,8 @@ a = Analysis(
     optimize=0,
 )
 pyz = PYZ(a.pure)
+
+ico_path = 'app/assets/app_icon.ico'
 
 exe = EXE(
     pyz,
@@ -38,12 +41,13 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ico_path if os.path.exists(ico_path) else None,
 )
 
 if sys.platform == 'darwin':
     app = BUNDLE(
         exe,
         name='奶龙投稿助手.app',
-        icon=None,
+        icon=ico_path if os.path.exists(ico_path) else None,
         bundle_identifier='com.nailong.tougao',
     )

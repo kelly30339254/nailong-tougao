@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+CATEGORIES = ["言情", "悬疑", "世情", "脑洞", "惊悚", "奇幻", "科幻", "武侠", "现实", "其他"]
+READER_GROUPS = ["男频", "女频", "通用"]
+EMOTIONS = ["甜", "虐", "爽", "燃", "暖", "虐心", "轻松"]
+STYLES = ["第一人称", "第三人称", "多视角"]
+
 
 @dataclass
 class Editor:
@@ -73,6 +78,7 @@ class Reply:
     is_auto_reply: bool = False
     classification_confidence: str = ""
     classification_reason: str = ""
+    body_full: str = ""
     received_at: str = ""
 
 

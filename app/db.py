@@ -140,6 +140,9 @@ class Database:
         if "last_error" not in subs_cols:
             self._conn.execute(
                 "ALTER TABLE submissions ADD COLUMN last_error TEXT DEFAULT ''")
+        if "last_urged_at" not in subs_cols:
+            self._conn.execute(
+                "ALTER TABLE submissions ADD COLUMN last_urged_at TEXT DEFAULT ''")
         replies_cols = {r["name"] for r in
                         self._conn.execute("PRAGMA table_info(replies)").fetchall()}
         reply_columns = (
@@ -152,6 +155,7 @@ class Database:
             ("is_auto_reply", "INTEGER DEFAULT 0"),
             ("classification_confidence", "TEXT DEFAULT ''"),
             ("classification_reason", "TEXT DEFAULT ''"),
+            ("body_full", "TEXT DEFAULT ''"),
         )
         for name, definition in reply_columns:
             if name not in replies_cols:
@@ -338,6 +342,18 @@ class Database:
             r = self._conn.execute("SELECT favorite FROM editors WHERE id=?", (editor_id,)).fetchone()
             return bool(r["favorite"]) if r else False
 
+    def set_favorites(self, editor_ids: list[int], favorite: bool = True) -> int:
+        """批量设置收藏。返回实际更新的行数。"""
+        ids = [int(eid) for eid in editor_ids if eid]
+        if not ids:
+            return 0
+        with self._lock, self._conn:
+            marks = ",".join("?" for _ in ids)
+            cur = self._conn.execute(
+                f"UPDATE editors SET favorite=? WHERE id IN ({marks})",
+                [int(favorite), *ids])
+            return cur.rowcount
+
     def toggle_blacklisted(self, editor_id: int) -> bool:
         with self._lock, self._conn:
             self._conn.execute("UPDATE editors SET blacklisted = 1 - blacklisted WHERE id=?", (editor_id,))
@@ -377,6 +393,12 @@ class Database:
                     seen.add(part)
                     result.append(part)
         return sorted(result)
+
+    def distinct_statuses(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT status FROM editors WHERE status != '' ORDER BY status").fetchall()
+        return [r["status"] for r in rows]
 
     # ---------- manuscripts ----------
     @staticmethod
@@ -701,35 +723,146 @@ class Database:
             return 0
 
     def backup_to(self, dest_path: str):
-        """用 sqlite3 backup API 导出到目标路径。"""
-        with self._lock:
-            dest = sqlite3.connect(dest_path)
-            try:
-                self._conn.backup(dest)
-                rows = dest.execute(
-                    "SELECT key,value FROM settings WHERE key LIKE 'mailbox_%'").fetchall()
-                for key, value in rows:
-                    try:
-                        data = json.loads(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(data, dict) and "auth_code" in data:
-                        data.pop("auth_code", None)
-                        dest.execute(
-                            "UPDATE settings SET value=? WHERE key=?",
-                            (json.dumps(data, ensure_ascii=False), key))
-                dest.commit()
-            finally:
-                dest.close()
+        """导出 zip（data.db + files/），或兼容旧调用直接写 .db。"""
+        import shutil
+        import tempfile
+        import zipfile
+        dest_path = dest_path or ""
+        tmp_dir = tempfile.mkdtemp(prefix="nailong_bak_")
+        try:
+            tmp_db = os.path.join(tmp_dir, "data.db")
+            with self._lock:
+                dest = sqlite3.connect(tmp_db)
+                try:
+                    self._conn.backup(dest)
+                    rows = dest.execute(
+                        "SELECT key,value FROM settings WHERE key LIKE 'mailbox_%'").fetchall()
+                    for key, value in rows:
+                        try:
+                            data = json.loads(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if isinstance(data, dict) and "auth_code" in data:
+                            data.pop("auth_code", None)
+                            dest.execute(
+                                "UPDATE settings SET value=? WHERE key=?",
+                                (json.dumps(data, ensure_ascii=False), key))
+                    dest.commit()
+                finally:
+                    dest.close()
+            if dest_path.lower().endswith(".zip"):
+                with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.write(tmp_db, "data.db")
+                    files_dir = self.files_dir
+                    if os.path.isdir(files_dir):
+                        for root, _dirs, names in os.walk(files_dir):
+                            for name in names:
+                                full = os.path.join(root, name)
+                                rel = os.path.relpath(full, os.path.dirname(files_dir))
+                                zf.write(full, rel.replace("\\", "/"))
+            else:
+                shutil.copy2(tmp_db, dest_path)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def restore_from(self, src_path: str):
-        """用 sqlite3 backup API 从源文件覆盖当前库（需重启生效）。"""
+        """从 zip 或旧版纯 .db 覆盖当前库；恢复前先兜底备份。"""
+        import shutil
+        import tempfile
+        import zipfile
+        self._safety_backup()
+        src_path = src_path or ""
+        tmp_dir = tempfile.mkdtemp(prefix="nailong_rst_")
+        try:
+            if src_path.lower().endswith(".zip"):
+                with zipfile.ZipFile(src_path, "r") as zf:
+                    zf.extractall(tmp_dir)
+                db_src = os.path.join(tmp_dir, "data.db")
+                files_src = os.path.join(tmp_dir, "files")
+                if os.path.isdir(files_src):
+                    dest_files = self.files_dir
+                    if os.path.isdir(dest_files):
+                        shutil.rmtree(dest_files, ignore_errors=True)
+                    shutil.copytree(files_src, dest_files)
+            else:
+                db_src = src_path
+            with self._lock:
+                src = sqlite3.connect(db_src)
+                try:
+                    src.backup(self._conn)
+                finally:
+                    src.close()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _safety_backup(self):
+        backup_dir = os.path.join(os.path.dirname(self.db_path), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        name = f"恢复前_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        try:
+            self.backup_to(os.path.join(backup_dir, name))
+        except Exception:
+            pass
+
+    def auto_backup_if_due(self, interval_days: int = 7, keep: int = 5) -> str | None:
+        last = ""
         with self._lock:
-            src = sqlite3.connect(src_path)
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key='last_auto_backup_at'").fetchone()
+            last = row["value"] if row else ""
+        due = True
+        if last:
             try:
-                src.backup(self._conn)
-            finally:
-                src.close()
+                prev = datetime.strptime(last[:19], "%Y-%m-%d %H:%M:%S")
+                due = datetime.now() - prev >= timedelta(days=max(1, interval_days))
+            except ValueError:
+                due = True
+        if not due:
+            return None
+        backup_dir = os.path.join(os.path.dirname(self.db_path), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        dest = os.path.join(backup_dir, f"自动_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+        self.backup_to(dest)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO settings(key,value) VALUES('last_auto_backup_at',?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (_now(),))
+        zips = sorted(
+            (os.path.join(backup_dir, n) for n in os.listdir(backup_dir)
+             if n.startswith("自动_") and n.endswith(".zip")),
+            key=os.path.getmtime)
+        for old in zips[:-max(1, keep)]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return dest
+
+    def list_submissions_for_manuscript(self, manuscript_id: int) -> list[Submission]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM submissions WHERE manuscript_id=? ORDER BY id DESC",
+                (manuscript_id,)).fetchall()
+        return [self._row_to_submission(r) for r in rows]
+
+    def update_submission_letter(self, submission_id: int, subject: str, body: str):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET subject=?, body=? WHERE id=?",
+                (subject, body, submission_id))
+
+    def update_scheduled_at(self, submission_id: int, scheduled_at: str):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET scheduled_at=? WHERE id=?",
+                (scheduled_at, submission_id))
+
+    def mark_urged(self, submission_id: int):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET last_urged_at=? WHERE id=?",
+                (_now(), submission_id))
 
     def clear_business_data(self):
         """清空文稿、投递记录、回信、稿费 4 张业务表；保留编辑列表与设置。"""
@@ -794,12 +927,44 @@ class Database:
         return self._row_to_submission(rows[0]) if len(rows) == 1 else None
 
     def count_editor_last_days(self, editor_id: int, days: int = 7) -> int:
+        return self.count_editors_last_days([editor_id], days).get(editor_id, 0)
+
+    def count_editors_last_days(self, editor_ids: list[int], days: int = 7) -> dict[int, int]:
+        ids = [int(i) for i in editor_ids if i]
+        if not ids:
+            return {}
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        marks = ",".join("?" for _ in ids)
         with self._lock:
-            r = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM submissions WHERE editor_id=? AND status='已发' AND sent_at >= ?",
-                (editor_id, since)).fetchone()
-        return r["c"]
+            rows = self._conn.execute(
+                f"SELECT editor_id, COUNT(*) AS c FROM submissions"
+                f" WHERE editor_id IN ({marks}) AND status='已发' AND sent_at >= ?"
+                f" GROUP BY editor_id",
+                ids + [since]).fetchall()
+        result = {eid: 0 for eid in ids}
+        for r in rows:
+            result[int(r["editor_id"])] = int(r["c"])
+        return result
+
+    def count_editor_related(self, editor_id: int) -> tuple[int, int]:
+        with self._lock:
+            subs = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM submissions WHERE editor_id=?", (editor_id,)).fetchone()["c"]
+            replies = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM replies WHERE submission_id IN "
+                "(SELECT id FROM submissions WHERE editor_id=?)", (editor_id,)).fetchone()["c"]
+        return int(subs), int(replies)
+
+    def count_manuscript_related(self, manuscript_id: int) -> tuple[int, int]:
+        with self._lock:
+            subs = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM submissions WHERE manuscript_id=?",
+                (manuscript_id,)).fetchone()["c"]
+            replies = self._conn.execute(
+                "SELECT COUNT(*) AS c FROM replies WHERE submission_id IN "
+                "(SELECT id FROM submissions WHERE manuscript_id=?)",
+                (manuscript_id,)).fetchone()["c"]
+        return int(subs), int(replies)
 
     def count_today(self, mailbox_name: str) -> int:
         """该邮箱今日已发数（大小写不敏感，与 reserve_daily_send 口径一致）。"""
@@ -823,6 +988,7 @@ class Database:
                      references=r["reference_ids"], is_auto_reply=bool(r["is_auto_reply"]),
                      classification_confidence=r["classification_confidence"],
                      classification_reason=r["classification_reason"],
+                     body_full=r["body_full"] if "body_full" in r.keys() else "",
                      received_at=r["received_at"])
 
     def insert_reply(self, r: Reply) -> int | None:
@@ -851,14 +1017,25 @@ class Database:
             cur = self._conn.execute(
                 "INSERT INTO replies(submission_id,from_email,subject,snippet,verdict,is_read,imap_uid,"
                 "mailbox_address,imap_folder,uid_validity,message_id,in_reply_to,reference_ids,"
-                "is_auto_reply,classification_confidence,classification_reason,received_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "is_auto_reply,classification_confidence,classification_reason,body_full,received_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r.submission_id, r.from_email, r.subject, r.snippet, r.verdict,
                  int(r.is_read), r.imap_uid, r.mailbox_address, r.imap_folder,
                  r.uid_validity, r.message_id, r.in_reply_to, r.references,
                  int(r.is_auto_reply), r.classification_confidence,
-                 r.classification_reason, r.received_at or _now()))
+                 r.classification_reason, r.body_full or "", r.received_at or _now()))
             return cur.lastrowid
+
+    def delete_reply(self, reply_id: int):
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM replies WHERE id=?", (reply_id,))
+
+    def delete_replies(self, ids: list[int]):
+        if not ids:
+            return
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            self._conn.execute(f"DELETE FROM replies WHERE id IN ({marks})", ids)
 
     def list_replies(self, unread_only: bool = False) -> list[Reply]:
         sql = "SELECT * FROM replies"
@@ -959,3 +1136,251 @@ class Database:
             })
         items.sort(key=lambda x: x["time"], reverse=True)
         return items[:limit]
+
+    # ---------- 分页查询 ----------
+    @staticmethod
+    def _order_clause(order_by: str | None, mapping: dict[str, str],
+                      default: str, desc: bool) -> str:
+        col = mapping.get(order_by or "", default)
+        direction = "DESC" if desc else "ASC"
+        return f"{col} {direction}"
+
+    def list_submissions_page(self, *, status_filter: str | None = None,
+                              reply_filter: str | None = None,
+                              keyword: str | None = None,
+                              offset: int = 0, limit: int = 50,
+                              order_by: str = "id",
+                              desc: bool = True) -> tuple[int, list[Submission]]:
+        """投递记录分页：可按文稿名/编辑/邮箱搜索，SQL ORDER BY + LIMIT。"""
+        order_map = {
+            "id": "s.id",
+            "title": "IFNULL(m.title,'')",
+            "editor": "IFNULL(e.name,'')",
+            "platform": "IFNULL(e.platform,'')",
+            "from_mailbox": "s.from_mailbox",
+            "sent_at": "s.sent_at",
+            "status": "s.status",
+            "reply_status": "s.reply_status",
+        }
+        where = ["1=1"]
+        args: list = []
+        if status_filter:
+            where.append("s.status=?")
+            args.append(status_filter)
+        if reply_filter == "未回复":
+            where.append("(s.reply_status='' OR s.reply_status='无')")
+        elif reply_filter and reply_filter not in ("全部", "全部判定"):
+            where.append("s.reply_status=?")
+            args.append(reply_filter)
+        if keyword:
+            like = f"%{keyword}%"
+            where.append(
+                "(IFNULL(m.title,'') LIKE ? OR IFNULL(e.name,'') LIKE ?"
+                " OR IFNULL(e.email,'') LIKE ? OR IFNULL(s.to_email,'') LIKE ?"
+                " OR IFNULL(s.from_mailbox,'') LIKE ?)")
+            args.extend([like, like, like, like, like])
+        where_sql = " AND ".join(where)
+        from_sql = (
+            "FROM submissions s"
+            " LEFT JOIN manuscripts m ON m.id=s.manuscript_id"
+            " LEFT JOIN editors e ON e.id=s.editor_id"
+            f" WHERE {where_sql}")
+        order_sql = self._order_clause(order_by, order_map, "s.id", desc)
+        limit = max(1, int(limit or 50))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) AS c {from_sql}", args).fetchone()["c"]
+            rows = self._conn.execute(
+                f"SELECT s.* {from_sql} ORDER BY {order_sql}, s.id DESC"
+                " LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
+        return total, [self._row_to_submission(r) for r in rows]
+
+    def list_replies_page(self, *, unread_only: bool = False,
+                          verdict: str | None = None,
+                          keyword: str | None = None,
+                          offset: int = 0, limit: int = 50,
+                          order_by: str = "id",
+                          desc: bool = True) -> tuple[int, list[Reply]]:
+        order_map = {
+            "id": "id",
+            "from_email": "from_email",
+            "verdict": "verdict",
+            "subject": "subject",
+            "snippet": "snippet",
+            "received_at": "received_at",
+        }
+        where = ["1=1"]
+        args: list = []
+        if unread_only:
+            where.append("is_read=0")
+        if verdict and verdict not in ("全部判定", "全部"):
+            where.append("verdict=?")
+            args.append(verdict)
+        if keyword:
+            like = f"%{keyword}%"
+            where.append(
+                "(IFNULL(from_email,'') LIKE ? OR IFNULL(subject,'') LIKE ?"
+                " OR IFNULL(snippet,'') LIKE ?)")
+            args.extend([like, like, like])
+        where_sql = " AND ".join(where)
+        order_sql = self._order_clause(order_by, order_map, "id", desc)
+        limit = max(1, int(limit or 50))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM replies WHERE {where_sql}",
+                args).fetchone()["c"]
+            rows = self._conn.execute(
+                f"SELECT * FROM replies WHERE {where_sql}"
+                f" ORDER BY {order_sql}, id DESC LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
+        return total, [self._row_to_reply(r) for r in rows]
+
+    def list_sales_page(self, *, keyword: str | None = None,
+                        date_from: str | None = None,
+                        date_to: str | None = None,
+                        offset: int = 0, limit: int = 50,
+                        order_by: str = "id",
+                        desc: bool = True) -> tuple[int, list[Sale]]:
+        order_map = {
+            "id": "s.id",
+            "title": "IFNULL(m.title,'')",
+            "platform": "s.platform",
+            "editor_name": "s.editor_name",
+            "amount": "s.amount",
+            "sale_date": "s.sale_date",
+            "payment_date": "s.payment_date",
+            "notes": "s.notes",
+        }
+        where = ["1=1"]
+        args: list = []
+        if keyword:
+            like = f"%{keyword}%"
+            where.append(
+                "(IFNULL(m.title,'') LIKE ? OR IFNULL(s.platform,'') LIKE ?"
+                " OR IFNULL(s.editor_name,'') LIKE ? OR IFNULL(s.notes,'') LIKE ?)")
+            args.extend([like, like, like, like])
+        if date_from:
+            where.append("s.sale_date>=?")
+            args.append(date_from)
+        if date_to:
+            where.append("s.sale_date<=?")
+            args.append(date_to)
+        where_sql = " AND ".join(where)
+        from_sql = (
+            "FROM sales s LEFT JOIN manuscripts m ON m.id=s.manuscript_id"
+            f" WHERE {where_sql}")
+        order_sql = self._order_clause(order_by, order_map, "s.id", desc)
+        limit = max(1, int(limit or 50))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) AS c {from_sql}", args).fetchone()["c"]
+            rows = self._conn.execute(
+                f"SELECT s.*, m.title AS mtitle {from_sql}"
+                f" ORDER BY {order_sql}, s.id DESC LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
+        return total, [self._row_to_sale(r) for r in rows]
+
+    def upsert_editors_bulk(self, editors: list[Editor]) -> tuple[int, int]:
+        """单事务按邮箱去重插入编辑。已存在或邮箱为空则跳过。返回 (导入, 跳过)。"""
+        imported = skipped = 0
+        with self._lock, self._conn:
+            existing = {
+                (r["email"] or "").strip().lower()
+                for r in self._conn.execute(
+                    "SELECT email FROM editors WHERE email != ''").fetchall()
+            }
+            for e in editors:
+                email = (e.email or "").strip()
+                if not email:
+                    skipped += 1
+                    continue
+                key = email.lower()
+                if key in existing:
+                    skipped += 1
+                    continue
+                self._conn.execute(
+                    "INSERT INTO editors(name,platform,email,genres,directions,status,"
+                    "fee_info,source_url,notes,favorite,blacklisted,created_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (e.name or email, e.platform or "", email, e.genres or "",
+                     e.directions or "", e.status or "", e.fee_info or "",
+                     e.source_url or "", e.notes or "", int(bool(e.favorite)),
+                     int(bool(e.blacklisted)), e.created_at or _now()))
+                existing.add(key)
+                imported += 1
+        return imported, skipped
+
+    def set_blacklisted_many(self, editor_ids: list[int], blacklisted: bool) -> int:
+        ids = [int(eid) for eid in editor_ids if eid]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE editors SET blacklisted=? WHERE id IN ({marks})",
+                [int(bool(blacklisted)), *ids])
+            return cur.rowcount
+
+    def mark_read_many(self, reply_ids: list[int]) -> int:
+        ids = [int(rid) for rid in reply_ids if rid]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE replies SET is_read=1 WHERE id IN ({marks})", ids)
+            return cur.rowcount
+
+    def delete_submissions(self, ids: list[int]) -> int:
+        ids = [int(sid) for sid in ids if sid]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"DELETE FROM submissions WHERE id IN ({marks})", ids)
+            return cur.rowcount
+
+    def delete_sales(self, ids: list[int]) -> int:
+        ids = [int(sid) for sid in ids if sid]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"DELETE FROM sales WHERE id IN ({marks})", ids)
+            return cur.rowcount
+
+    def count_editors_related_many(self, editor_ids: list[int]) -> tuple[int, int]:
+        ids = [int(eid) for eid in editor_ids if eid]
+        if not ids:
+            return 0, 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock:
+            n_sub = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM submissions WHERE editor_id IN ({marks})",
+                ids).fetchone()["c"]
+            n_rep = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM replies WHERE submission_id IN "
+                f"(SELECT id FROM submissions WHERE editor_id IN ({marks}))",
+                ids).fetchone()["c"]
+        return n_sub, n_rep
+
+    def count_manuscripts_related_many(self, manuscript_ids: list[int]) -> tuple[int, int]:
+        ids = [int(mid) for mid in manuscript_ids if mid]
+        if not ids:
+            return 0, 0
+        marks = ",".join("?" for _ in ids)
+        with self._lock:
+            n_sub = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM submissions WHERE manuscript_id IN ({marks})",
+                ids).fetchone()["c"]
+            n_rep = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM replies WHERE submission_id IN "
+                f"(SELECT id FROM submissions WHERE manuscript_id IN ({marks}))",
+                ids).fetchone()["c"]
+        return n_sub, n_rep

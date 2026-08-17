@@ -247,7 +247,7 @@ check("工作台过稿统计联动", dashboard_page.stat_cards["过稿"].number.
 
 # ---------- navigate 全 8 页 ----------
 for page_id in ("dashboard", "submit", "records", "replies", "sales",
-                "manuscripts", "editors", "settings"):
+                "stats", "manuscripts", "editors", "settings"):
     win.navigate(page_id)
     check(f"navigate {page_id}", win.stack.currentWidget() is win._pages[page_id])
 
@@ -279,9 +279,9 @@ tab_texts = [submit_page.tab_bar.tabText(i) for i in range(submit_page.tab_bar.c
 check("无随机推荐标签", "随机推荐" not in tab_texts and tab_texts == ["全部编辑", "收藏分类"])
 settings_page = win._pages["settings"]
 settings_tabs = [settings_page.tabs.tabText(i) for i in range(settings_page.tabs.count())]
-check("设置页 7 个标签无作者与落款", len(settings_tabs) == 7
-      and "作者与落款" not in settings_tabs
-      and "投稿信模板" in settings_tabs and "数据备份" in settings_tabs)
+check("设置页标签无作者与落款", "作者与落款" not in settings_tabs
+      and "投稿信模板" in settings_tabs and "AI 接口" in settings_tabs
+      and "数据备份" in settings_tabs)
 check("侧栏无分组标签", len(win.findChildren(QLabel, "navGroupLabel")) == 0)
 promo_buttons = win.findChildren(PromoButton)
 check("顶栏 3 个功能按钮", len(promo_buttons) == 3

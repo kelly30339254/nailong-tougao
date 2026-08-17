@@ -49,6 +49,7 @@ def ingest_results(db: Database, mailbox_address: str, results: list) -> IngestR
             from_email=from_email,
             subject=item.get("subject") or "",
             snippet=item.get("snippet") or "",
+            body_full=item.get("body_full") or "",
             verdict=verdict,
             imap_uid=item.get("uid") or "",
             mailbox_address=mailbox_address,

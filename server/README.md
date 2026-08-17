@@ -6,13 +6,11 @@
 ## 实际架构
 
 - 环境：`nailong-d4g922z6h6d9ff59e`（ap-shanghai，体验版）
-- 客户端硬编码的两个地址（CloudBase 默认域名，不是主站域名）：
-  - 激活接口：`https://nailong-d4g922z6h6d9ff59e-1455870789.tcloudbaseapp.com/api/activate`
-    （HTTP 路由 → SCF 云函数 `activate`，代码在 `server/cloudbase/activate/index.js`）
-  - 版本信息：`https://nailong-d4g922z6h6d9ff59e-1455870789.tcloudbaseapp.com/version.json`
-    （静态托管根目录的 `server/version.json`）
-- 数据库：`cardkeys` 集合，记录结构 `{key, used, machine_id, activated_at}`，
-  key 为规范化形式（无连字符，如 `NLK2E358JKG5XRJ`）。
+- 客户端硬编码的地址（CloudBase 默认域名，不是主站域名）：
+  - 账号接口：`…/api/auth`（登录 / 注册 / 绑卡 / 校验会话，云函数 `auth`）
+  - 版本信息：`…/version.json`（静态托管根目录的 `server/version.json`）
+- 激活体系（v1.3.0+）：邮箱账号登录 + 卡密绑定到账号，不再用机器指纹核销。
+- 数据库：账号与卡密绑定记录在 CloudBase；卡密规范化形式仍为无连字符大写。
 - 注意：主站 `nailong.zhiyuxiezuo.com` 走 EdgeOne，指向前端 SPA（任意路径都返回
   index.html），**不能**用来挂 API 或 version.json，除非以后在 EdgeOne 控制台加回源规则。
 
@@ -62,15 +60,15 @@ npx -y -p @cloudbase/cli tcb fn deploy activate --force
 
 ### 发版（每次更新软件）
 
-1. 改 `app/__init__.py` 的 `APP_VERSION`（如 `1.1.0`）。
-2. 运行 `build_exe.bat` 打包。
-3. exe 压缩上传夸克网盘。
-4. 编辑 `server/version.json`（版本号、更新说明、网盘链接），然后：
+1. 改 `app/__init__.py` 的 `APP_VERSION`（如 `1.3.6`）。
+2. 运行 `build_installer.bat` 打包（会自动十进制升版，可用 `--no-bump` 保持当前号）。
+3. 上传安装包到网盘 / GitHub Release。
+4. **必须**同步 `server/version.json` 的 `version` / `notes` / `download_url`（可选 `github_url`）。打 `v*` 标签时 Actions 会产出 `version-json` artifact（已填 GitHub Release 直链），下载后核对再部署：
    ```bash
    cd server/cloudbase
    MSYS_NO_PATHCONV=1 npx -y -p @cloudbase/cli tcb hosting deploy ../version.json version.json
    ```
-5. 所有用户下次启动软件即收到更新提示。
+5. 在一台干净机器上打开旧版，确认能收到更新提示。不部署 version.json，用户永远看不到新版本。
 
 ### 查卡密使用情况
 

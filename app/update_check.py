@@ -42,4 +42,5 @@ def check_for_update(timeout: int = 15) -> dict | None:
         "version": remote,
         "notes": str(payload.get("notes") or ""),
         "download_url": str(payload.get("download_url") or ""),
+        "github_url": str(payload.get("github_url") or ""),
     }

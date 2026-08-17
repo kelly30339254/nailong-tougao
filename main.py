@@ -13,6 +13,8 @@ from app.db import Database
 from app.settings_store import SettingsStore
 from app.theme import apply_theme, THEMES, DEFAULT_THEME
 from app.main_window import MainWindow, NAV_ITEMS
+from app.icons import APP_USER_MODEL_ID, app_icon, apply_windows_app_id, refresh_shell_icons
+from app.logging_setup import setup_logging, install_excepthook, get_logger
 
 
 def _make_window():
@@ -60,8 +62,17 @@ def main():
     from PySide6.QtWidgets import QMessageBox
     from app.db import data_dir
 
+    # 必须在 QApplication 之前设置，否则任务栏会沿用 python.exe / 旧 exe 缓存图标
+    apply_windows_app_id()
+
     app = QApplication(sys.argv)
     app.setApplicationName("奶龙投稿助手")
+    app.setApplicationDisplayName("奶龙投稿助手")
+    app.setOrganizationName("Nailong")
+    app.setOrganizationDomain("nailong.zhiyuxiezuo.com")
+    app.setDesktopFileName(APP_USER_MODEL_ID)
+    app.setWindowIcon(app_icon())
+    app.setQuitOnLastWindowClosed(False)
 
     lock = QLockFile(os.path.join(data_dir(), "app.lock"))
     lock.setStaleLockTime(5000)
@@ -121,12 +132,55 @@ def main():
         # 用户确认没有别的实例在跑：删掉锁文件强行接管
         lock.removeStaleLockFile()
         lock.tryLock(100)
-    if not lic.is_activated():
-        from app.activation_dialog import ActivationDialog
+    setup_logging()
+    install_excepthook()
+    log = get_logger("main")
+    log.info("启动")
+
+    # 账号登录守卫：先看本地会话，联网校验放到后台，避免断网卡 12 秒
+    from PySide6.QtWidgets import QMessageBox as _QMsg
+    from app.activation_dialog import ActivationDialog
+
+    if not lic.is_logged_in():
         if ActivationDialog().exec() != QDialog.Accepted:
             sys.exit(0)
+    elif not lic.is_activated():
+        if ActivationDialog(initial_mode="card").exec() != QDialog.Accepted:
+            sys.exit(0)
     window = _make_window()
+    window.setWindowIcon(app_icon())
+    if sys.platform == "win32":
+        window.setProperty("_q_windowsAppId", APP_USER_MODEL_ID)
     window.show()
+
+    def _after_auth_check(status: dict):
+        code = status.get("code")
+        if code == "kicked":
+            _QMsg.information(window, "奶龙投稿助手",
+                              "你的账号已在其他设备登录，本设备已下线。")
+        if code in ("kicked", "expired"):
+            if ActivationDialog(window).exec() != QDialog.Accepted:
+                window._quit_app()
+        elif code == "need_card":
+            if ActivationDialog(window, initial_mode="card").exec() != QDialog.Accepted:
+                window._quit_app()
+
+    from app.workers import AiCallWorker
+    window._auth_worker = AiCallWorker(lic.session_status, window)
+    window._auth_worker.finished_ok.connect(_after_auth_check)
+    window._auth_worker.failed.connect(lambda msg: log.warning("会话校验失败：%s", msg))
+    window._auth_worker.start()
+
+    import threading
+    threading.Thread(target=refresh_shell_icons, daemon=True).start()
+    try:
+        interval = int(window.store.get("auto_backup_days") or "7")
+        keep = int(window.store.get("auto_backup_keep") or "5")
+        threading.Thread(
+            target=lambda: window.db.auto_backup_if_due(interval, keep),
+            daemon=True).start()
+    except Exception:
+        log.warning("自动备份启动失败", exc_info=True)
     code = app.exec()
     try:
         window.db.close()

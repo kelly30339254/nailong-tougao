@@ -8,15 +8,17 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QPushButton, QTabWidget,
     QFrame, QRadioButton, QButtonGroup, QScrollArea, QPlainTextEdit,
-    QFileDialog, QMessageBox,
+    QFileDialog, QMessageBox, QDialog,
 )
 
 from .. import APP_VERSION
+from .. import license as lic
 from ..models import MailboxConfig
 from ..settings_store import PROVIDER_NAMES, provider_preset
 from ..theme import THEMES
-from ..workers import TestMailboxWorker
+from ..workers import TestMailboxWorker, AiTestWorker, AiLetterTplWorker
 from ..letter import DEFAULT_SUBJECT_TPL, DEFAULT_BODY_TPL, PLACEHOLDER_HINT
+from ..ai_client import AI_PRESETS, DEFAULT_PROVIDER, preset_for
 
 
 class MailboxCard(QFrame):
@@ -197,8 +199,10 @@ class SettingsPage(QWidget):
         self.tabs = QTabWidget()
         outer.addWidget(self.tabs, 1)
 
+        self._build_account_tab()
         self._build_mailbox_tab()
         self._build_letter_tab()
+        self._build_ai_tab()
         self._build_strategy_tab()
         self._build_fetch_tab()
         self._build_theme_tab()
@@ -219,6 +223,75 @@ class SettingsPage(QWidget):
         self.refresh()
         self._connect_auto_save()
         self._loading = False
+
+    # ---------- 标签页：账号 ----------
+    def _build_account_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 18, 20, 18)
+
+        self.account_email_label = QLabel("")
+        self.account_email_label.setStyleSheet("font-weight: bold; font-size: 16px;")
+        layout.addWidget(self.account_email_label)
+
+        self.account_card_label = QLabel("")
+        self.account_card_label.setObjectName("hintText")
+        self.account_card_label.setWordWrap(True)
+        layout.addWidget(self.account_card_label)
+
+        first_hint = QLabel("第一次使用：先到「发信邮箱」填写授权码并测试，再到「投稿信模板」确认正文。")
+        first_hint.setObjectName("hintText")
+        first_hint.setWordWrap(True)
+        layout.addWidget(first_hint)
+        hint = QLabel(
+            "账号采用「登录 + 卡密绑定」方式：登录后在同一账号下换电脑、重装系统，"
+            "只要登录同一账号即可继续使用已绑定的卡密。同一账号同一时间仅允许一台设备在线，"
+            "新设备登录后旧设备会被强制下线。")
+        hint.setObjectName("hintText")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        bind_card_btn = QPushButton("绑定卡密")
+        bind_card_btn.clicked.connect(self._on_bind_card)
+        btn_row.addWidget(bind_card_btn)
+        logout_btn = QPushButton("退出登录")
+        logout_btn.clicked.connect(self._on_logout)
+        btn_row.addWidget(logout_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        layout.addStretch()
+        self.tabs.addTab(self._scrollable(tab), "账号")
+
+    def _refresh_account(self):
+        sess = lic.session()
+        if not sess:
+            self.account_email_label.setText("未登录")
+            self.account_card_label.setText("")
+            return
+        email = sess.get("email", "")
+        card_bound = bool(sess.get("card_bound"))
+        self.account_email_label.setText(email)
+        self.account_card_label.setText("卡密状态：已绑定" if card_bound else "卡密状态：未绑定")
+        self.account_card_label.setStyleSheet(
+            f"color: {'#2F9E44' if card_bound else '#E03131'};")
+
+    def _on_bind_card(self):
+        from ..auth_dialog import AuthDialog
+        dlg = AuthDialog(self, initial_mode="card")
+        if dlg.exec() == QDialog.Accepted:
+            self._refresh_account()
+
+    def _on_logout(self):
+        ret = QMessageBox.question(
+            self, "确认退出登录",
+            "退出后需重新登录才能使用本软件，确定退出吗？",
+            QMessageBox.Yes | QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
+        lic.logout()
+        self.main_window._quit_app()
 
     # ---------- 标签页：发信邮箱 ----------
     def _build_mailbox_tab(self):
@@ -270,6 +343,7 @@ class SettingsPage(QWidget):
         vbox.setSpacing(8)
         hint = QLabel(PLACEHOLDER_HINT)
         hint.setObjectName("hintText")
+        hint.setWordWrap(True)
         vbox.addWidget(hint)
         vbox.addWidget(QLabel("主题模板"))
         self.letter_subject_edit = QLineEdit()
@@ -277,15 +351,222 @@ class SettingsPage(QWidget):
         vbox.addWidget(QLabel("正文模板"))
         self.letter_body_edit = QPlainTextEdit()
         vbox.addWidget(self.letter_body_edit, 1)
+        self.letter_vary_check = QCheckBox("自动发信时每封微调措辞（不使用AI）")
+        self.letter_vary_check.setChecked(True)
+        self.letter_vary_check.setToolTip(
+            "同一模板发给不同编辑时，只替换客套话（如「冒昧来信」「期待审阅」），"
+            "作品名、字数、分类和自定义 {变:A|B} 槽位按编辑轮换，降低正文完全相同被判垃圾邮件的概率。")
+        vbox.addWidget(self.letter_vary_check)
+        self.letter_ai_vary_check = QCheckBox("发信时用 AI 微调文案（需先接入 API）")
+        self.letter_ai_vary_check.setToolTip(
+            "每封发送前让大模型改客套话，作品名和字数保持不变。未接入或调用失败时自动退回上方的规则微调（不使用AI）。")
+        vbox.addWidget(self.letter_ai_vary_check)
+        btn_row = QHBoxLayout()
+        ai_tpl_btn = QPushButton("AI 生成模板")
+        ai_tpl_btn.setToolTip("按你填写的要求生成可复用的主题和正文模板，需先接入 API")
+        ai_tpl_btn.clicked.connect(self._on_ai_generate_tpl)
+        btn_row.addWidget(ai_tpl_btn)
         reset_btn = QPushButton("恢复默认")
         reset_btn.clicked.connect(self._on_reset_letter_tpl)
-        vbox.addWidget(reset_btn, 0, Qt.AlignLeft)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        vbox.addLayout(btn_row)
         layout.addWidget(card, 1)
         self.tabs.addTab(tab, "投稿信模板")
 
     def _on_reset_letter_tpl(self):
         self.letter_subject_edit.setText(DEFAULT_SUBJECT_TPL)
         self.letter_body_edit.setPlainText(DEFAULT_BODY_TPL)
+
+    def _on_ai_generate_tpl(self):
+        cfg = self.store.get_ai_config()
+        if not cfg.configured():
+            QMessageBox.information(
+                self, "尚未接入 AI",
+                "请先到「设置 → AI 接口」填写 API Key。")
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i) == "AI 接口":
+                    self.tabs.setCurrentIndex(i)
+                    break
+            return
+        from ..ai_smart import DEFAULT_TPL_REQUIREMENTS
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI 生成投稿信模板")
+        dlg.setMinimumSize(520, 380)
+        box = QVBoxLayout(dlg)
+        box.addWidget(QLabel("生成要求（可自行修改后再生成）："))
+        req_edit = QPlainTextEdit()
+        req_edit.setPlainText(DEFAULT_TPL_REQUIREMENTS)
+        box.addWidget(req_edit, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(dlg.reject)
+        row.addWidget(cancel)
+        go = QPushButton("生成")
+        go.setObjectName("primaryBtn")
+        row.addWidget(go)
+        box.addLayout(row)
+
+        def start_gen():
+            text = req_edit.toPlainText().strip()
+            if not text:
+                QMessageBox.warning(dlg, "提示", "请填写生成要求")
+                return
+            go.setEnabled(False)
+            go.setText("生成中…")
+            worker = AiLetterTplWorker(cfg, text, dlg)
+
+            def ok(subject: str, body: str):
+                go.setEnabled(True)
+                go.setText("生成")
+                dlg.accept()
+                self._preview_ai_template(subject, body)
+
+            def fail(message: str):
+                go.setEnabled(True)
+                go.setText("生成")
+                QMessageBox.warning(dlg, "生成失败", message)
+
+            worker.finished_ok.connect(ok)
+            worker.failed.connect(fail)
+            dlg._worker = worker
+            worker.start()
+
+        go.clicked.connect(start_gen)
+        dlg.exec()
+
+    def _preview_ai_template(self, subject: str, body: str):
+        preview = QDialog(self)
+        preview.setWindowTitle("预览生成结果")
+        preview.setMinimumSize(520, 420)
+        box = QVBoxLayout(preview)
+        box.addWidget(QLabel("主题"))
+        subj = QLineEdit(subject)
+        subj.setReadOnly(True)
+        box.addWidget(subj)
+        box.addWidget(QLabel("正文"))
+        body_view = QPlainTextEdit()
+        body_view.setPlainText(body)
+        body_view.setReadOnly(True)
+        box.addWidget(body_view, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        discard = QPushButton("丢弃")
+        discard.clicked.connect(preview.reject)
+        row.addWidget(discard)
+        apply_btn = QPushButton("写入模板")
+        apply_btn.setObjectName("primaryBtn")
+        row.addWidget(apply_btn)
+        box.addLayout(row)
+
+        def apply():
+            cur_s = self.letter_subject_edit.text()
+            cur_b = self.letter_body_edit.toPlainText()
+            changed = (cur_s not in ("", DEFAULT_SUBJECT_TPL) or
+                       cur_b not in ("", DEFAULT_BODY_TPL))
+            if changed:
+                ret = QMessageBox.question(
+                    preview, "覆盖模板", "当前模板不是默认内容，确定用生成结果覆盖吗？")
+                if ret != QMessageBox.Yes:
+                    return
+            self.letter_subject_edit.setText(subject)
+            self.letter_body_edit.setPlainText(body)
+            self._schedule_auto_save()
+            preview.accept()
+
+        apply_btn.clicked.connect(apply)
+        preview.exec()
+
+    # ---------- 标签页：AI 接口 ----------
+    def _build_ai_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 18, 20, 18)
+        card = QFrame()
+        card.setObjectName("card")
+        vbox = QVBoxLayout(card)
+        vbox.setContentsMargins(20, 18, 20, 18)
+        vbox.setSpacing(10)
+        hint = QLabel(
+            "可选接入大模型，用于投稿页的「AI智选」和发信时的「AI微调」。"
+            "不填 Key 时仍可使用智选排序（不使用AI）和规则微调（不使用AI）。默认推荐 SpaceXAI（xAI Grok）。")
+        hint.setObjectName("hintText")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.ai_provider_combo = QComboBox()
+        self.ai_provider_combo.addItems(list(AI_PRESETS.keys()))
+        self.ai_provider_combo.currentTextChanged.connect(self._on_ai_provider_changed)
+        form.addRow("服务商", self.ai_provider_combo)
+        self.ai_base_edit = QLineEdit()
+        self.ai_base_edit.setPlaceholderText("https://api.x.ai/v1")
+        form.addRow("接口地址", self.ai_base_edit)
+        self.ai_model_edit = QLineEdit()
+        self.ai_model_edit.setPlaceholderText("grok-4.5")
+        form.addRow("模型", self.ai_model_edit)
+        self.ai_key_edit = QLineEdit()
+        self.ai_key_edit.setEchoMode(QLineEdit.Password)
+        self.ai_key_edit.setPlaceholderText("API Key，保存在系统凭据里")
+        form.addRow("API Key", self.ai_key_edit)
+        vbox.addLayout(form)
+
+        self.ai_hint_label = QLabel("")
+        self.ai_hint_label.setObjectName("hintText")
+        self.ai_hint_label.setWordWrap(True)
+        vbox.addWidget(self.ai_hint_label)
+
+        test_row = QHBoxLayout()
+        self.ai_test_btn = QPushButton("测试连接")
+        self.ai_test_btn.clicked.connect(self._on_test_ai)
+        test_row.addWidget(self.ai_test_btn)
+        self.ai_test_result = QLabel("")
+        self.ai_test_result.setWordWrap(True)
+        test_row.addWidget(self.ai_test_result, 1)
+        vbox.addLayout(test_row)
+
+        layout.addWidget(card)
+        layout.addStretch()
+        self.tabs.addTab(self._scrollable(tab), "AI 接口")
+        self._ai_test_worker: AiTestWorker | None = None
+
+    def _on_ai_provider_changed(self, provider: str):
+        url, model, tip = preset_for(provider or DEFAULT_PROVIDER)
+        if provider != "自定义":
+            if url:
+                self.ai_base_edit.setText(url)
+            if model:
+                self.ai_model_edit.setText(model)
+        self.ai_hint_label.setText(tip)
+        self.ai_base_edit.setEnabled(provider == "自定义")
+
+    def _ai_config_from_form(self):
+        from ..ai_client import AiConfig
+        return AiConfig(
+            provider=self.ai_provider_combo.currentText(),
+            base_url=self.ai_base_edit.text().strip(),
+            model=self.ai_model_edit.text().strip(),
+            api_key=self.ai_key_edit.text().strip(),
+        )
+
+    def _on_test_ai(self):
+        cfg = self._ai_config_from_form()
+        if not cfg.configured():
+            QMessageBox.warning(self, "提示", "请先填写 API Key、接口地址和模型。")
+            return
+        self.ai_test_btn.setEnabled(False)
+        self.ai_test_result.setText("正在测试……")
+        self.ai_test_result.setStyleSheet("color: #8A8087;")
+        self._ai_test_worker = AiTestWorker(cfg, self)
+        self._ai_test_worker.result.connect(self._on_ai_test_result)
+        self._ai_test_worker.finished.connect(lambda: self.ai_test_btn.setEnabled(True))
+        self._ai_test_worker.start()
+
+    def _on_ai_test_result(self, ok: bool, message: str):
+        self.ai_test_result.setText(message)
+        self.ai_test_result.setStyleSheet(f"color: {'#2F9E44' if ok else '#E03131'};")
 
     # ---------- 标签页：投递策略 ----------
     def _build_strategy_tab(self):
@@ -410,8 +691,15 @@ class SettingsPage(QWidget):
         btn_row.addWidget(reseed_btn)
         btn_row.addStretch()
         vbox.addLayout(btn_row)
+        open_bak = QPushButton("打开备份目录")
+        open_bak.clicked.connect(self._on_open_backups)
+        btn_row.addWidget(open_bak)
+        log_btn = QPushButton("导出诊断日志")
+        log_btn.clicked.connect(self._on_export_log)
+        btn_row.addWidget(log_btn)
         hint = QLabel(
-            "备份包含编辑、文稿、投递记录、回信与普通设置，不包含邮箱授权码。导入会覆盖当前数据。")
+            "备份为 zip（含数据库和 files 附件），不含邮箱授权码。导入会覆盖当前数据，"
+            "恢复前会自动在 backups/ 再留一份兜底。启动超过 7 天会自动备份并轮换保留 5 份。")
         hint.setObjectName("hintText")
         hint.setWordWrap(True)
         vbox.addWidget(hint)
@@ -456,15 +744,38 @@ class SettingsPage(QWidget):
         layout.addStretch()
         self.tabs.addTab(tab, "关于")
 
+    def _on_open_backups(self):
+        import os
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        from ..db import data_dir
+        folder = os.path.join(data_dir(), "backups")
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def _on_export_log(self):
+        from ..logging_setup import export_log_path
+        import shutil
+        src = export_log_path()
+        path, _ = QFileDialog.getSaveFileName(self, "导出诊断日志", "nailong-app.log", "日志 (*.log)")
+        if not path:
+            return
+        try:
+            shutil.copy2(src, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(self, "已导出", path)
+
     def _refresh_backup_info(self):
         size = self.db.db_file_size()
         self.backup_size_label.setText(f"数据库大小：{size / 1024:.0f} KB")
 
     def _on_backup_export(self):
         from datetime import datetime
-        default_name = f"奶龙投稿助手备份-{datetime.now().strftime('%Y%m%d')}.db"
+        default_name = f"奶龙投稿助手备份-{datetime.now().strftime('%Y%m%d')}.zip"
         path, _ = QFileDialog.getSaveFileName(self, "导出备份", default_name,
-                                              "数据库文件 (*.db)")
+                                              "备份包 (*.zip);;旧版数据库 (*.db)")
         if not path:
             return
         try:
@@ -476,7 +787,7 @@ class SettingsPage(QWidget):
 
     def _on_backup_import(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入备份", "",
-                                              "数据库文件 (*.db)")
+                                              "备份文件 (*.zip *.db)")
         if not path:
             return
         ret = QMessageBox.warning(
@@ -562,6 +873,12 @@ class SettingsPage(QWidget):
         for signal in (
             self.letter_subject_edit.textEdited,
             self.letter_body_edit.textChanged,
+            self.letter_vary_check.toggled,
+            self.letter_ai_vary_check.toggled,
+            self.ai_provider_combo.currentIndexChanged,
+            self.ai_base_edit.textEdited,
+            self.ai_model_edit.textEdited,
+            self.ai_key_edit.textEdited,
             self.one_draft_check.toggled,
             self.interval_spin.valueChanged,
             self.urge_days_spin.valueChanged,
@@ -609,10 +926,25 @@ class SettingsPage(QWidget):
         mailboxes = self.store.load_mailboxes()
         for card, cfg in zip(self.mailbox_cards, mailboxes):
             card.load_config(cfg)
-        # 投稿信模板
+        # 投稿信模板（文本没变就不要 setPlainText，否则光标会跳回开头）
         subject_tpl, body_tpl = self.store.get_letter_template()
-        self.letter_subject_edit.setText(subject_tpl)
-        self.letter_body_edit.setPlainText(body_tpl)
+        if self.letter_subject_edit.text() != subject_tpl:
+            self.letter_subject_edit.setText(subject_tpl)
+        if self.letter_body_edit.toPlainText() != body_tpl:
+            self.letter_body_edit.setPlainText(body_tpl)
+        self.letter_vary_check.setChecked(self.store.get_letter_vary())
+        self.letter_ai_vary_check.setChecked(self.store.get_letter_ai_vary())
+        ai_cfg = self.store.get_ai_config()
+        self.ai_provider_combo.blockSignals(True)
+        self.ai_provider_combo.setCurrentText(ai_cfg.provider or DEFAULT_PROVIDER)
+        self.ai_provider_combo.blockSignals(False)
+        self.ai_base_edit.setText(ai_cfg.base_url)
+        self.ai_model_edit.setText(ai_cfg.model)
+        if self.ai_key_edit.text() != ai_cfg.api_key:
+            self.ai_key_edit.setText(ai_cfg.api_key)
+        _url, _model, tip = preset_for(ai_cfg.provider or DEFAULT_PROVIDER)
+        self.ai_hint_label.setText(tip)
+        self.ai_base_edit.setEnabled((ai_cfg.provider or DEFAULT_PROVIDER) == "自定义")
         # 策略
         one_draft, interval, _daily = self.store.get_strategy()
         self.one_draft_check.setChecked(one_draft)
@@ -627,6 +959,8 @@ class SettingsPage(QWidget):
         self.sync_theme_selection(self.store.get_theme())
         # 备份信息
         self._refresh_backup_info()
+        # 账号
+        self._refresh_account()
         self._loading = False
 
     def save_all(self):
@@ -635,6 +969,13 @@ class SettingsPage(QWidget):
         self.store.save_mailbox_count(len(self.mailbox_cards))
         self.store.save_letter_template(self.letter_subject_edit.text(),
                                         self.letter_body_edit.toPlainText())
+        self.store.save_letter_vary(self.letter_vary_check.isChecked())
+        self.store.save_letter_ai_vary(self.letter_ai_vary_check.isChecked())
+        self.store.save_ai_config(
+            self.ai_provider_combo.currentText(),
+            self.ai_base_edit.text(),
+            self.ai_model_edit.text(),
+            self.ai_key_edit.text())
         # 每日上限以各邮箱卡片「单日上限」为准，此处不再提供全局死配置
         self.store.save_strategy(self.one_draft_check.isChecked(),
                                  self.interval_spin.value())
@@ -643,6 +984,6 @@ class SettingsPage(QWidget):
                                      self.fetch_interval_spin.value(),
                                      self.lookback_spin.value())
         self.main_window.update_mail_badge()
-        self.main_window.data_changed.emit()
+        # 不发 data_changed：当前页 refresh 会 setPlainText，把正在编辑的光标打回开头
         self.save_hint.setText("已保存")
         self.save_hint.setStyleSheet("color: #2F9E44;")

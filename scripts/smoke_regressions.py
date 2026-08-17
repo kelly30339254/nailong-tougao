@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app import mailer, receiver
 from app.db import Database
@@ -76,7 +76,7 @@ index = submit_page.manuscript_combo.findData(manuscript_id)
 submit_page.manuscript_combo.setCurrentIndex(index)
 submit_page.smart_check.setChecked(True)
 check("智选匹配排序", submit_page._current_editors[0].id == editor_a
-      and submit_page.table.item(0, 12).text().startswith("9分"))
+      and "题材：悬疑" in submit_page.table.item(0, 12).text())
 check("智选展示准确命中值", "题材：悬疑" in submit_page.table.item(0, 12).text()
       and "篇幅：短篇" in submit_page.table.item(0, 12).text())
 check("智选展示编辑资料", submit_page.table.horizontalHeaderItem(5).text() == "稿件类型"
@@ -88,6 +88,99 @@ check("智选详情支持二次确认", "稿件类型：短篇" in details_tip
       and "收稿方向：悬疑、推理" in details_tip
       and "收稿状态：正常收稿" in details_tip)
 check("智选不自动勾选", not submit_page._checked_ids)
+from app.smart_match import match_editor, manuscript_query
+from app.models import Editor as _Ed
+from app.ai_client import parse_json_object, DEFAULT_PROVIDER
+from app.ai_smart import _VERDICTS
+from app.pages.records import _humanize_send_error
+q = manuscript_query(None, "悬疑", "短篇", "女频", "爽", "第一人称")
+hit = match_editor(_Ed(id=1, genres="短篇", directions="悬疑、推理", status="正常收稿"), q)
+miss = match_editor(_Ed(id=2, genres="短篇", directions="言情", status="正常收稿"), q)
+check("原版智选近义/分字段", hit[0] > miss[0] and "题材：悬疑" in hit[1])
+ultra = match_editor(_Ed(id=3, genres="超短篇", directions="综合", status="正常收稿"), q)
+short = match_editor(_Ed(id=4, genres="短篇", directions="综合", status="正常收稿"), q)
+check("原版智选不把超短篇当短篇", short[0] > ultra[0])
+check("JSON 围栏可解析", parse_json_object("```json\n{\"a\":1}\n```")["a"] == 1)
+check("AI 默认服务商", DEFAULT_PROVIDER == "SpaceXAI")
+check("投稿页有 AI智选按钮", submit_page.ai_smart_btn.text() == "AI智选")
+check("用模板生成按钮", any(
+    b.text() == "用模板生成" for b in submit_page.findChildren(type(submit_page.ai_smart_btn))))
+check("按本篇生成按钮", any(
+    b.text() == "按本篇生成一封" for b in submit_page.findChildren(type(submit_page.ai_smart_btn))))
+check("回信页有 AI判定", win._pages["replies"].ai_btn.text() == "AI判定")
+check("失败原因可读", "授权" in _humanize_send_error("535 Authentication failed"))
+check("AI判定可选结果", "过稿" in _VERDICTS and "待确认" in _VERDICTS)
+check("工作台卡片可点", win._pages["dashboard"].stat_cards["未读回信"]._on_click is not None)
+check("未接入时 AI 推荐按钮不可用", submit_page.ai_pick_btn.isEnabled() is False)
+check("智选排序已标注不使用AI", submit_page.smart_check.text() == "智选排序（不使用AI）")
+check("规则微调已标注不使用AI", "不使用AI" in settings_page.letter_vary_check.text())
+from app.ai_smart import DEFAULT_TPL_REQUIREMENTS
+check("默认生成要求含占位符", "{作品名}" in DEFAULT_TPL_REQUIREMENTS and "{编辑称呼}" in DEFAULT_TPL_REQUIREMENTS)
+
+from app.auth_dialog import AuthDialog
+auth = AuthDialog(None, "login")
+check("登录模式字段", not auth.email_row.isHidden() and not auth.password_row.isHidden()
+      and auth.code_row.isHidden() and auth.card_row.isHidden())
+auth.set_mode("register")
+check("注册模式字段", not auth.code_row.isHidden() and not auth.confirm_row.isHidden()
+      and auth.current_mode() == "register")
+auth.set_mode("card")
+check("绑卡模式字段", not auth.card_row.isHidden() and auth.email_row.isHidden()
+      and auth.cancel_btn.text() == "退出登录")
+auth.close()
+
+real_q = QMessageBox.question
+real_exit = os._exit
+os._exit = lambda code: None
+QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+try:
+    win._quitting = False
+    win._force_quit = False
+    settings_page._on_logout()
+    check("退出登录真正退出", win._force_quit is True)
+finally:
+    QMessageBox.question = real_q
+    os._exit = real_exit
+
+# 投稿信模板刷新不得把光标打回开头
+settings_page.letter_body_edit.setPlainText("ABCDEFG")
+cursor = settings_page.letter_body_edit.textCursor()
+cursor.setPosition(4)
+settings_page.letter_body_edit.setTextCursor(cursor)
+store.save_letter_template(settings_page.letter_subject_edit.text(), "ABCDEFG")
+settings_page.save_all()
+settings_page.refresh()
+check("模板保存刷新不丢光标",
+      settings_page.letter_body_edit.toPlainText() == "ABCDEFG"
+      and settings_page.letter_body_edit.textCursor().position() == 4)
+
+# 多层筛选：短篇 + 正常收稿
+submit_page.refresh()
+submit_page.genre_combo.setCurrentText("短篇")
+submit_page.status_combo.setCurrentText("正常收稿")
+check("多层筛选短篇且正常收稿",
+      len(submit_page._current_editors) >= 2
+      and all("短篇" in (e.genres or "")
+              and (e.status or "").startswith("正常收稿")
+              for e in submit_page._current_editors))
+
+from app.letter import vary_letter, apply_variant_slots
+import random
+s0, b0 = "投稿《谜案》12000字 悬疑", (
+    "尊敬的老师编辑：\n\n    冒昧来信，向您自荐我的作品《谜案》。"
+    "本篇全文约12000字，分类为悬疑。稿件完整内容请见邮件附件，期待您的审阅。\n")
+s_a, b_a = vary_letter(s0, b0, "seed-a")
+s_a2, b_a2 = vary_letter(s0, b0, "seed-a")
+s_b, b_b = vary_letter(s0, b0, "seed-b")
+check("微调同种子稳定", b_a == b_a2 and s_a == s_a2)
+check("微调保留作品事实", "《谜案》" in b_a and "12000" in b_a and "悬疑" in b_a)
+check("变位占位符展开",
+      apply_variant_slots("请{变:审阅|过目}", random.Random(1)) in ("请审阅", "请过目")
+      and "{变:" not in vary_letter("x", "请{变:审阅|过目}", "slot")[1])
+
+# 一键收藏当前筛选（避开对话框）
+added = db.set_favorites([editor_a], True)
+check("一键收藏写入", added == 1 and db.get_editor(editor_a).favorite is True)
 
 # 每编辑真实个性化、唯一 Message-ID 和原子一稿一投
 submit_page.subject_edit.setText("投稿《谜案》")
@@ -212,6 +305,27 @@ fallback_row = next(s for s in db.list_submissions() if s.id == fallback_submiss
 check("满额邮箱自动切换", sent_by == ["second@qq.com"]
       and fallback_row.from_mailbox == "second@qq.com")
 
+from app.icons import APP_USER_MODEL_ID, app_icon, apply_windows_app_id
+from app.main_window import QApplication as MainWindowQApp
+check("应用图标非空", not app_icon().isNull())
+check("应用身份常量", APP_USER_MODEL_ID == "com.nailong.tougao")
+apply_windows_app_id()
+check("托盘退出能解析 QApplication", MainWindowQApp is QApplication)
+check("托盘退出函数已接线", callable(getattr(win, "_quit_app", None)))
+from PySide6.QtGui import QCloseEvent
+session_event = QCloseEvent()
+win._session_quit = True
+win._force_quit = False
+win._tray_icon = object()  # 假装有托盘，确认会话退出不会 hide
+win.closeEvent(session_event)
+check("安装器/关机关闭不会缩到托盘", session_event.isAccepted() or win._force_quit is True)
+win._session_quit = False
+win._force_quit = False
+win._tray_icon = None
+if win._tray_icon is not None:
+    check("托盘菜单未挂在隐藏窗口上",
+          win._tray_menu is not None and win._tray_menu.parent() is None)
+
 check("教程及指定文案", len(LINKS) == 3
       and LINKS[0][1] == "AI辅助写作·短篇收稿风向"
       and LINKS[1][1] == "长篇网文风向·实用创作工具"
@@ -220,6 +334,38 @@ check("教程及指定文案", len(LINKS) == 3
       and LINKS[2][3] == TUTORIAL_ACTION
       and all("BV1pMMQ6MEBx" not in item[3] for item in LINKS))
 
+from app.widgets import PagedTable, PageBar
+from app.workers import ImportEditorsWorker
+
+ok_n, skip_n = db.upsert_editors_bulk([
+    Editor(name="批量甲", email="bulk-a@example.com"),
+    Editor(name="批量甲重复", email="bulk-a@example.com"),
+    Editor(name="无邮箱", email=""),
+])
+check("upsert_editors_bulk 去重", ok_n == 1 and skip_n == 2)
+total, page = db.list_submissions_page(offset=0, limit=1, order_by="id", desc=True)
+check("list_submissions_page 分页", total >= 1 and len(page) == 1)
+total_r, page_r = db.list_replies_page(keyword="不存在的关键词xyz", offset=0, limit=50)
+check("list_replies_page 搜索落空", total_r == 0 and page_r == [])
+total_s, page_s = db.list_sales_page(offset=0, limit=50)
+check("list_sales_page 可调用", total_s == len(page_s))
+bar = PageBar()
+bar.set_total(120)
+check("PageBar 页数", bar.pages == 3 and bar.page_size == 50)
+paged = PagedTable(["A", "B"], sort_keys=["a", "b"])
+paged.set_items([type("R", (), {"id": i, "a": i, "b": str(i)})() for i in range(60)])
+check("PagedTable 默认每页 50", paged.table.rowCount() == 50 and paged.bar.total == 60)
+from app.workers import DownloadUpdateWorker
+from app import update_check as _uc
+check("DownloadUpdateWorker 已注册", callable(DownloadUpdateWorker))
+check("ImportEditorsWorker 已注册", callable(ImportEditorsWorker))
+_uc.fetch_json = lambda url, timeout=15: {
+    "version": "99.9.9", "notes": "", "download_url": "https://x",
+    "github_url": "https://github.com/x/y/a.exe"}
+fresh = _uc.check_for_update()
+check("check_for_update 含 github_url", fresh is not None and "github_url" in fresh)
+
+win._force_quit = True
 win.close()
 db.close()
 print()

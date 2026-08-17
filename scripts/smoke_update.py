@@ -9,7 +9,9 @@ import tempfile
 
 os.environ["NAILONG_DATA_DIR"] = tempfile.mkdtemp(prefix="nailong_update_")
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
 RESULTS = []
 
@@ -23,6 +25,12 @@ def check(name, cond):
 
 from app import APP_VERSION  # noqa: E402
 from app import update_check  # noqa: E402
+from build_windows import next_version  # noqa: E402
+
+check("打包升版 1.3.1→1.3.2", next_version("1.3.1") == "1.3.2")
+check("打包升版 1.3.9→1.4.0", next_version("1.3.9") == "1.4.0")
+check("打包升版 1.9.9→2.0.0", next_version("1.9.9") == "2.0.0")
+check("打包升版 9.9.9→10.0.0", next_version("9.9.9") == "10.0.0")
 
 # ---------- 版本比较 ----------
 check("1.1.0 > 1.0.0", update_check.is_newer("1.1.0", "1.0.0") is True)
@@ -35,12 +43,15 @@ check("1.10.0 > 1.9.0（按数字而非字符串）",
 
 # ---------- check_for_update：有新版 ----------
 def fake_fetch_new(url, timeout=15):
-    return {"version": "99.0.0", "notes": "大更新", "download_url": "https://pan.quark.cn/s/x"}
+    return {"version": "99.0.0", "notes": "大更新",
+            "download_url": "https://pan.quark.cn/s/x",
+            "github_url": "https://github.com/x/y/releases/download/v99.0.0/a.exe"}
 
 update_check.fetch_json = fake_fetch_new
 info = update_check.check_for_update()
 check("有新版返回信息", info is not None and info["version"] == "99.0.0"
-      and info["download_url"] == "https://pan.quark.cn/s/x")
+      and info["download_url"] == "https://pan.quark.cn/s/x"
+      and info["github_url"].endswith("a.exe"))
 
 # ---------- check_for_update：同版本 ----------
 def fake_fetch_same(url, timeout=15):

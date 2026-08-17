@@ -67,3 +67,37 @@ jobs:
             奶龙投稿助手-*.zip
             奶龙投稿助手-*.dmg
             奶龙投稿助手-*.deb
+
+  version-json:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 生成待部署 version.json
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          tag = os.environ["GITHUB_REF_NAME"]
+          ver = tag.lstrip("v")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          path = "server/version.json"
+          with open(path, encoding="utf-8") as f:
+              data = json.load(f)
+          data["version"] = ver
+          data["github_url"] = (
+              f"https://github.com/{repo}/releases/download/{tag}/"
+              "奶龙投稿助手-windows.zip"
+          )
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          print(open(path, encoding="utf-8").read())
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: version-json
+          path: server/version.json

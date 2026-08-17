@@ -9,6 +9,16 @@
       "runtime": "Nodejs20.19",
       "handler": "index.main",
       "memorySize": 128
+    },
+    {
+      "name": "auth",
+      "timeout": 15,
+      "runtime": "Nodejs20.19",
+      "handler": "index.main",
+      "memorySize": 256,
+      "envVariables": {
+        "TCB_ENV": "nailong-d4g922z6h6d9ff59e"
+      }
     }
   ]
 }

@@ -5,10 +5,11 @@
     python scripts/make_cardkeys.py 100 -o keys.json
 
 生成的 JSON 每行一条记录（CloudBase 控制台「数据库 → cardkeys 集合 → 导入」
-可直接识别的 JSON Lines 格式），字段：key / used / machine_id / activated_at。
+可直接识别的 JSON Lines 格式），字段：key / used / machine_id / activated_at / bound_user。
 key 为规范化形式（如 NLKAAAABBBBCCCC，无连字符）；发给用户时显示为
 NLK-AAAA-BBBB-CCCC，客户端和云函数都会先去掉连字符再比对。
 字母表去掉了 0/O/1/I/L 等易混字符。
+v1.3.0 起卡密绑定到账号（bound_user=用户 uid）而非机器，machine_id 仅作旧数据兼容。
 """
 from __future__ import annotations
 
@@ -55,7 +56,8 @@ def main() -> int:
     with open(output, "w", encoding="utf-8") as f:
         for key in sorted(keys):
             f.write(json.dumps(
-                {"key": key, "used": False, "machine_id": "", "activated_at": ""},
+                {"key": key, "used": False, "machine_id": "",
+                 "activated_at": "", "bound_user": ""},
                 ensure_ascii=False) + "\n")
 
     sample = [display_key(k) for k in sorted(keys)[:5]]

@@ -9,17 +9,13 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QPushButton, QTableWidget, QTableWidgetItem, QDialog, QFormLayout,
-    QFileDialog, QMessageBox, QAbstractItemView, QHeaderView, QMenu,
+    QFileDialog, QMessageBox, QHeaderView, QMenu,
 )
 
-from ..models import Manuscript
+from ..models import Manuscript, CATEGORIES, READER_GROUPS, EMOTIONS, STYLES
 from ..docx_reader import read_docx_text, read_txt, count_cjk_words
-from ..widgets import mk_item, badge_cell
+from ..widgets import mk_item, badge_cell, PagedTable, export_csv, ProgressDialog
 
-CATEGORIES = ["言情", "悬疑", "世情", "脑洞", "惊悚", "奇幻", "科幻", "武侠", "现实", "其他"]
-READER_GROUPS = ["男频", "女频", "通用"]
-EMOTIONS = ["甜", "虐", "爽", "燃", "暖", "虐心", "轻松"]
-STYLES = ["第一人称", "第三人称", "多视角"]
 FILE_FILTER = "文稿文件 (*.docx *.txt)"
 
 
@@ -112,6 +108,10 @@ class ManuscriptDialog(QDialog):
         layout.addLayout(form)
 
         btns = QHBoxLayout()
+        ai_btn = QPushButton("AI 补标签")
+        ai_btn.setToolTip("根据标题和正文开头建议分类、篇幅、读者群等，需接入 API")
+        ai_btn.clicked.connect(self._on_ai_tags)
+        btns.addWidget(ai_btn)
         btns.addStretch()
         cancel_btn = QPushButton("取消")
         cancel_btn.clicked.connect(self.reject)
@@ -121,6 +121,56 @@ class ManuscriptDialog(QDialog):
         save_btn.clicked.connect(self._on_save)
         btns.addWidget(save_btn)
         layout.addLayout(btns)
+
+    def _on_ai_tags(self):
+        page = self.parent()
+        store = getattr(page, "store", None)
+        main_window = getattr(page, "main_window", None)
+        if store is None or main_window is None:
+            QMessageBox.warning(self, "提示", "无法读取 AI 设置")
+            return
+        from ..ai_ui import require_ai_config
+        from ..workers import AiCallWorker
+        from .. import ai_smart
+        cfg = require_ai_config(self, store, main_window)
+        if cfg is None:
+            return
+        excerpt = ""
+        if self.file_path:
+            try:
+                excerpt = read_manuscript_text(self.file_path)[:1800]
+            except Exception:
+                excerpt = ""
+        title = self.title_edit.text().strip()
+        if not title and not excerpt:
+            QMessageBox.warning(self, "提示", "请先填写标题或选择文件")
+            return
+        self._ai_worker = AiCallWorker(
+            lambda: ai_smart.suggest_manuscript_tags(cfg, title, excerpt), self)
+
+        def ok(tags: dict):
+            if tags.get("category"):
+                self.category_combo.setCurrentText(tags["category"])
+            if tags.get("reader_group") in READER_GROUPS:
+                self.reader_combo.setCurrentText(tags["reader_group"])
+            if tags.get("emotion") in EMOTIONS:
+                self.emotion_combo.setCurrentText(tags["emotion"])
+            if tags.get("style") in STYLES:
+                self.style_combo.setCurrentText(tags["style"])
+            if tags.get("genre_type"):
+                self.genre_edit.setText(tags["genre_type"])
+            extra = tags.get("reason") or ""
+            QMessageBox.information(
+                self, "已填入建议",
+                "已写入分类 / 篇幅 / 读者群等标签，请核对后保存。"
+                + (f"\n依据：{extra}" if extra else ""))
+
+        def fail(msg):
+            QMessageBox.warning(self, "AI 补标签失败", str(msg))
+
+        self._ai_worker.finished_ok.connect(ok)
+        self._ai_worker.failed.connect(fail)
+        self._ai_worker.start()
 
     def _on_choose_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择文稿文件", "", FILE_FILTER)
@@ -173,8 +223,15 @@ class ManuscriptsPage(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索标题 / 分类 / 类型…")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.textChanged.connect(lambda *_a: self.refresh())
+        self.search_edit.textChanged.connect(self._on_search)
         top.addWidget(self.search_edit, 1)
+        export_btn = QPushButton("导出 CSV")
+        export_btn.clicked.connect(self._on_export)
+        top.addWidget(export_btn)
+        self.batch_delete_btn = QPushButton("批量删除")
+        self.batch_delete_btn.setEnabled(False)
+        self.batch_delete_btn.clicked.connect(self._on_batch_delete)
+        top.addWidget(self.batch_delete_btn)
         upload_btn = QPushButton("上传 txt/docx")
         upload_btn.clicked.connect(self._on_upload)
         top.addWidget(upload_btn)
@@ -184,15 +241,16 @@ class ManuscriptsPage(QWidget):
         top.addWidget(add_btn)
         layout.addLayout(top)
 
-        # 表格
-        self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(
-            ["标题", "状态", "字数", "分类", "读者", "情绪", "风格", "类型", "创建时间", "操作"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(36)
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.paged = PagedTable(
+            ["标题", "状态", "字数", "分类", "读者", "情绪", "风格", "类型", "创建时间", "操作"],
+            sort_keys=["title", None, "word_count", "category", "reader_group",
+                       "emotion", "style", "genre_type", "created_at", None],
+            action_cols={1, 9},
+            empty_text="还没有文稿，点右上角新建",
+            store=store,
+            width_key="table_widths_manuscripts",
+        )
+        self.table = self.paged.table
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Fixed)
@@ -200,11 +258,15 @@ class ManuscriptsPage(QWidget):
         header.setSectionResizeMode(9, QHeaderView.Fixed)
         self.table.setColumnWidth(9, 170)
         header.setStretchLastSection(False)
-        layout.addWidget(self.table, 1)
+        self.paged.set_binder(self._bind_row)
+        self.paged.selection_changed.connect(self._update_batch_btns)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+        layout.addWidget(self.paged, 1)
 
         self.refresh()
 
-    def refresh(self):
+    def _filtered_manuscripts(self) -> list:
         manuscripts = self.db.list_manuscripts()
         keyword = self.search_edit.text().strip().lower()
         if keyword:
@@ -212,83 +274,96 @@ class ManuscriptsPage(QWidget):
                            if keyword in (m.title or "").lower()
                            or keyword in (m.category or "").lower()
                            or keyword in (m.genre_type or "").lower()]
-        # 文稿 → 最新一条售出记录
+        return manuscripts
+
+    def refresh(self):
         sold_map: dict[int, object] = {}
         for s in self.db.list_sales():
             if s.manuscript_id not in sold_map:
                 sold_map[s.manuscript_id] = s
-        self._row_manuscripts: list = []
-        self.table.setRowCount(0)
-        if not manuscripts:
-            self.table.setRowCount(1)
-            item = mk_item("还没有文稿，点右上角新建", Qt.AlignCenter)
-            item.setForeground(Qt.gray)
-            self.table.setItem(0, 0, item)
-            self.table.setSpan(0, 0, 1, 10)
-            return
+        self._sold_map = sold_map
+        items = self._filtered_manuscripts()
+        self._row_manuscripts = items
+        self.paged.set_items(items, reset_page=False)
+        self._update_batch_btns()
 
-        self.table.setRowCount(len(manuscripts))
-        for row, m in enumerate(manuscripts):
-            self._row_manuscripts.append(m)
-            self.table.setItem(row, 0, mk_item(m.title or ""))
-            sale = sold_map.get(m.id)
-            if sale is not None:
-                amount_text = f" {sale.amount:g}元" if sale.amount is not None else ""
-                if sale.payment_date:
-                    payment_text = f" {sale.payment_date} 打款"
-                elif sale.payment_month:
-                    payment_text = f" {sale.payment_month} 打款（仅月份）"
-                else:
-                    payment_text = ""
-                self.table.setCellWidget(row, 1, badge_cell(
-                    "已售", "pass",
-                    tooltip=f"已售：{sale.platform} {sale.editor_name}{amount_text}{payment_text}"))
+    def _update_batch_btns(self):
+        self.batch_delete_btn.setEnabled(bool(self.paged.selected_items()))
+
+    def _bind_row(self, table, row, m):
+        sold_map = getattr(self, "_sold_map", {})
+        title_item = mk_item(m.title or "")
+        title_item.setData(Qt.UserRole, m.id)
+        table.setItem(row, 0, title_item)
+        sale = sold_map.get(m.id)
+        if sale is not None:
+            amount_text = f" {sale.amount:g}元" if sale.amount is not None else ""
+            if sale.payment_date:
+                payment_text = f" {sale.payment_date} 打款"
+            elif sale.payment_month:
+                payment_text = f" {sale.payment_month} 打款（仅月份）"
             else:
-                # 未售出行也给出状态，而不是空白浪费一列
-                self.table.setCellWidget(row, 1, badge_cell("未售", "other"))
+                payment_text = ""
+            table.setCellWidget(row, 1, badge_cell(
+                "已售", "pass",
+                tooltip=f"已售：{sale.platform} {sale.editor_name}{amount_text}{payment_text}"))
+        else:
+            table.setCellWidget(row, 1, badge_cell("未售", "other"))
 
-            values = [str(m.word_count or ""), m.category, m.reader_group,
-                      m.emotion, m.style, m.genre_type, m.created_at]
-            for col, text in enumerate(values, start=2):
-                self.table.setItem(row, col, mk_item(text or ""))
+        values = [str(m.word_count or ""), m.category, m.reader_group,
+                  m.emotion, m.style, m.genre_type, m.created_at]
+        for col, text in enumerate(values, start=2):
+            table.setItem(row, col, mk_item(text or ""))
 
-            ops = QWidget()
-            ops_layout = QHBoxLayout(ops)
-            ops_layout.setContentsMargins(2, 0, 2, 0)
-            ops_layout.setSpacing(4)
-            if m.file_path:
-                open_btn = QPushButton("打开")
-                open_btn.setObjectName("iconBtn")
-                open_btn.setToolTip("打开文稿文件")
-                open_btn.clicked.connect(
-                    lambda _=False, fp=m.file_path: QDesktopServices.openUrl(
-                        QUrl.fromLocalFile(fp)))
-                ops_layout.addWidget(open_btn)
-            edit_btn = QPushButton("编辑")
-            edit_btn.setObjectName("iconBtn")
-            edit_btn.clicked.connect(lambda _=False, mid=m.id: self._on_edit(mid))
-            ops_layout.addWidget(edit_btn)
-            sale_btn = QPushButton("售出")
-            sale_btn.setObjectName("iconBtn")
-            sale_btn.setStyleSheet("color: #2F9E44;")
-            sale_btn.clicked.connect(lambda _=False, mid=m.id: self._on_add_sale(mid))
-            ops_layout.addWidget(sale_btn)
-            del_btn = QPushButton("删除")
-            del_btn.setObjectName("iconBtn")
-            del_btn.setStyleSheet("color: #E03131;")
-            del_btn.clicked.connect(lambda _=False, mm=m: self._on_delete(mm))
-            ops_layout.addWidget(del_btn)
-            self.table.setCellWidget(row, 9, ops)
+        ops = QWidget()
+        ops_layout = QHBoxLayout(ops)
+        ops_layout.setContentsMargins(2, 0, 2, 0)
+        ops_layout.setSpacing(4)
+        if m.file_path:
+            open_btn = QPushButton("打开")
+            open_btn.setObjectName("iconBtn")
+            open_btn.setToolTip("打开文稿文件")
+            open_btn.clicked.connect(
+                lambda _=False, fp=m.file_path: QDesktopServices.openUrl(
+                    QUrl.fromLocalFile(fp)))
+            ops_layout.addWidget(open_btn)
+        track_btn = QPushButton("轨迹")
+        track_btn.setObjectName("iconBtn")
+        track_btn.clicked.connect(lambda _=False, mid=m.id: self._on_track(mid))
+        ops_layout.addWidget(track_btn)
+        edit_btn = QPushButton("编辑")
+        edit_btn.setObjectName("iconBtn")
+        edit_btn.clicked.connect(lambda _=False, mid=m.id: self._on_edit(mid))
+        ops_layout.addWidget(edit_btn)
+        sale_btn = QPushButton("售出")
+        sale_btn.setObjectName("iconBtn")
+        sale_btn.setStyleSheet("color: #2F9E44;")
+        sale_btn.clicked.connect(lambda _=False, mid=m.id: self._on_add_sale(mid))
+        ops_layout.addWidget(sale_btn)
+        del_btn = QPushButton("删除")
+        del_btn.setObjectName("iconBtn")
+        del_btn.setStyleSheet("color: #E03131;")
+        del_btn.clicked.connect(lambda _=False, mm=m: self._on_delete(mm))
+        ops_layout.addWidget(del_btn)
+        table.setCellWidget(row, 9, ops)
 
-        # 右键菜单：打开 / 编辑 / 售出 / 删除
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._on_context_menu)
+    def _on_search(self):
+        sold_map: dict[int, object] = {}
+        for s in self.db.list_sales():
+            if s.manuscript_id not in sold_map:
+                sold_map[s.manuscript_id] = s
+        self._sold_map = sold_map
+        items = self._filtered_manuscripts()
+        self._row_manuscripts = items
+        self.paged.set_items(items, reset_page=True)
+        self._update_batch_btns()
 
     def _on_context_menu(self, pos):
+        items = self.paged.page_items
         row = self.table.rowAt(pos.y())
-        if row < 0 or row >= len(self._row_manuscripts):
+        if row < 0 or row >= len(items):
             return
-        m = self._row_manuscripts[row]
+        m = items[row]
         menu = QMenu(self)
         if m.file_path:
             menu.addAction("打开文件", lambda: QDesktopServices.openUrl(
@@ -297,6 +372,28 @@ class ManuscriptsPage(QWidget):
         menu.addAction("登记售出", lambda: self._on_add_sale(m.id))
         menu.addAction("删除", lambda: self._on_delete(m))
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _on_track(self, manuscript_id: int):
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QHeaderView
+        subs = self.db.list_submissions_for_manuscript(manuscript_id)
+        editors = {e.id: e for e in self.db.list_editors(include_blacklisted=True)}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("投递轨迹")
+        dlg.setMinimumSize(640, 360)
+        box = QVBoxLayout(dlg)
+        table = QTableWidget(len(subs), 6)
+        table.setHorizontalHeaderLabels(["时间", "编辑", "平台", "状态", "回复", "主题"])
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for row, s in enumerate(subs):
+            e = editors.get(s.editor_id)
+            vals = [s.sent_at or s.scheduled_at or s.created_at if hasattr(s, "created_at") else (s.sent_at or s.scheduled_at or ""),
+                    e.name if e else "", e.platform if e else "", s.status,
+                    s.reply_status or "", s.subject or ""]
+            for col, text in enumerate(vals):
+                table.setItem(row, col, mk_item(str(text or "")))
+        box.addWidget(table)
+        dlg.exec()
 
     def _on_add(self):
         dlg = ManuscriptDialog(self.db, self)
@@ -317,7 +414,8 @@ class ManuscriptsPage(QWidget):
             self.refresh()
 
     def _on_delete(self, manuscript: Manuscript):
-        extra = "\n该文稿的售出记录、投递记录与相关回信将一并删除。"
+        n_sub, n_rep = self.db.count_manuscript_related(manuscript.id)
+        extra = f"\n将连带删除 {n_sub} 条投递记录和 {n_rep} 封回信，且不可恢复。"
         ret = QMessageBox.question(self, "确认删除",
                                    f"确定删除文稿《{manuscript.title}》吗？{extra}")
         if ret == QMessageBox.Yes:
@@ -338,24 +436,59 @@ class ManuscriptsPage(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, "上传文稿", "", FILE_FILTER)
         if not paths:
             return
-        ok = failed = 0
-        errors: list[str] = []
-        for path in paths:
-            try:
-                # 先读源文件，成功后再复制（失败不留下孤儿副本）
-                text = read_manuscript_text(path)
-                copied = copy_to_files_dir(self.db.files_dir, path)
-                title = os.path.splitext(os.path.basename(path))[0]
-                self.db.insert_manuscript(Manuscript(
-                    title=title, file_path=copied,
-                    word_count=count_cjk_words(text)))
-                ok += 1
-            except Exception as exc:
-                failed += 1
-                errors.append(f"{os.path.basename(path)}：{exc}")
+        from ..workers import ImportManuscriptsWorker
+        dlg = ProgressDialog("导入文稿", self)
+        worker = ImportManuscriptsWorker(self.db, paths, self)
+
+        def on_progress(i, n, text):
+            dlg.set_progress(i, n, f"正在导入第 {i}/{n} 篇：{text}")
+            if dlg.is_cancelled():
+                worker.stop()
+
+        def on_done(ok, failed, errors):
+            dlg.accept()
+            self.main_window.data_changed.emit()
+            self.refresh()
+            message = f"成功导入 {ok} 篇"
+            if failed:
+                message += f"，失败 {failed} 篇：\n" + "\n".join(errors or [])
+            QMessageBox.information(self, "上传完成", message)
+
+        def on_fail(msg):
+            dlg.reject()
+            QMessageBox.warning(self, "导入失败", str(msg))
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_fail)
+        self._import_worker = worker
+        worker.start()
+        dlg.exec()
+        if dlg.is_cancelled() and worker.isRunning():
+            worker.stop()
+
+    def _on_export(self):
+        rows = []
+        for m in self._filtered_manuscripts():
+            rows.append([
+                m.title, m.word_count, m.category, m.reader_group,
+                m.emotion, m.style, m.genre_type, m.created_at,
+            ])
+        export_csv(self, ["标题", "字数", "分类", "读者", "情绪", "风格", "类型", "创建时间"],
+                   rows, "文稿库.csv")
+
+    def _on_batch_delete(self):
+        items = self.paged.selected_items()
+        if not items:
+            return
+        n_sub, n_rep = self.db.count_manuscripts_related_many([m.id for m in items])
+        ret = QMessageBox.question(
+            self, "批量删除",
+            f"确定删除选中的 {len(items)} 篇文稿吗？\n"
+            f"将连带删除 {n_sub} 条投递记录和 {n_rep} 封回信，且不可恢复。")
+        if ret != QMessageBox.Yes:
+            return
+        for m in items:
+            self.db.delete_manuscript(m.id)
         self.main_window.data_changed.emit()
         self.refresh()
-        message = f"成功导入 {ok} 篇"
-        if failed:
-            message += f"，失败 {failed} 篇：\n" + "\n".join(errors)
-        QMessageBox.information(self, "上传完成", message)

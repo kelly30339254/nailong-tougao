@@ -1,12 +1,158 @@
 """后台线程（QThread）：网络和耗时任务不阻塞界面。"""
 from __future__ import annotations
 
+import csv
+import io
+import logging
+import os
+import shutil
 import time
 
 from PySide6.QtCore import QThread, Signal
 
-from .models import MailboxConfig
+from .models import Editor, MailboxConfig, Manuscript
 from . import mailer, receiver, updater, update_check
+
+_log = logging.getLogger(__name__)
+
+_EDITOR_CSV_ALIASES = {
+    "name": ("名称", "name"),
+    "platform": ("平台", "platform"),
+    "email": ("邮箱", "email"),
+    "genres": ("题材", "genres"),
+    "directions": ("收稿方向", "directions"),
+    "status": ("状态", "status"),
+    "fee_info": ("稿费", "fee_info"),
+    "source_url": ("来源", "source_url"),
+    "notes": ("备注", "notes"),
+}
+
+
+def _is_temp_smtp_error(exc: Exception) -> bool:
+    import smtplib
+    import socket
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, smtplib.SMTPResponseException) and 400 <= exc.smtp_code < 500:
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "temporarily" in text
+
+
+class VaryLettersWorker(QThread):
+    progress = Signal(int, int, str)
+    finished_ok = Signal(object)
+
+    def __init__(self, jobs: list, cfg, title: str, extra: str, parent=None, db=None):
+        super().__init__(parent)
+        self.jobs = jobs
+        self.cfg = cfg
+        self.title = title
+        self.extra = extra
+        self.db = db
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        from . import ai_smart
+        from .letter import vary_letter
+        total = len(self.jobs)
+        for i, job in enumerate(self.jobs):
+            name = job.get("editor_name") or job.get("to") or ""
+            self.progress.emit(i + 1, total, f"正在微调第 {i + 1}/{total} 封：{name}")
+            subject, body = job.get("subject", ""), job.get("body", "")
+            if not self._stopped:
+                try:
+                    subject, body = ai_smart.vary_letter_ai(
+                        self.cfg, subject, body, name, self.title, self.extra)
+                except Exception:
+                    seed = f"{job.get('submission_id')}:{self.title}"
+                    subject, body = vary_letter(subject, body, seed)
+            else:
+                seed = f"{job.get('submission_id')}:{self.title}"
+                subject, body = vary_letter(subject, body, seed)
+            job["subject"], job["body"] = subject, body
+            if self.db is not None and job.get("submission_id"):
+                try:
+                    self.db.update_submission_letter(job["submission_id"], subject, body)
+                except Exception:
+                    pass
+        self.finished_ok.emit(self.jobs)
+
+
+class AiTestWorker(QThread):
+    result = Signal(bool, str)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+
+    def run(self):
+        from . import ai_client
+        try:
+            text = ai_client.chat(
+                self.config,
+                [{"role": "user", "content": "只回复：OK"}],
+                timeout=25, temperature=0, max_tokens=16)
+            ok = bool(text)
+            self.result.emit(ok, "连接成功" if ok else "接口没有返回内容")
+        except Exception as exc:
+            self.result.emit(False, str(exc))
+
+
+class AiRankWorker(QThread):
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config, query: dict, editors: list, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.query = query
+        self.editors = editors
+
+    def run(self):
+        from . import ai_smart
+        try:
+            result = ai_smart.rank_editors(self.config, self.query, self.editors)
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AiCallWorker(QThread):
+    """通用 AI 后台调用：fn() 的返回值经 finished_ok 传回。"""
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.finished_ok.emit(self.fn())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AiLetterTplWorker(QThread):
+    finished_ok = Signal(str, str)
+    failed = Signal(str)
+
+    def __init__(self, config, requirements: str, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.requirements = requirements
+
+    def run(self):
+        from . import ai_smart
+        try:
+            subject, body = ai_smart.generate_letter_template(self.config, self.requirements)
+            self.finished_ok.emit(subject, body)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class TestMailboxWorker(QThread):
@@ -60,6 +206,7 @@ class SendWorker(QThread):
             sid = job.get("submission_id", -1)
             to = job.get("to", "")
             mailbox = self.mailboxes[i % len(self.mailboxes)]
+            send_kwargs = {}
             try:
                 if self.db is not None:
                     selected = None
@@ -85,7 +232,30 @@ class SendWorker(QThread):
                     job.get("attachment_path") or None, **send_kwargs)
                 self.item_done.emit(sid, True, "", mailbox.address, False)
             except Exception as exc:
-                self.item_done.emit(sid, False, str(exc), mailbox.address, False)
+                if (_is_temp_smtp_error(exc) and not self._stopped
+                        and not os.environ.get("NAILONG_DATA_DIR")
+                        and not os.environ.get("NAILONG_SMOKE")):
+                    self.progress.emit(i + 1, total, f"{to} 临时失败，60 秒后重试…")
+                    deadline = time.time() + 60
+                    while time.time() < deadline and not self._stopped:
+                        time.sleep(0.2)
+                    if not self._stopped:
+                        try:
+                            mailer.send_mail(
+                                mailbox, to, job.get("subject", ""), job.get("body", ""),
+                                job.get("attachment_path") or None, **send_kwargs)
+                            self.item_done.emit(sid, True, "", mailbox.address, False)
+                            if i < total - 1 and not self._stopped:
+                                wait_end = time.time() + self.interval_seconds
+                                while time.time() < wait_end and not self._stopped:
+                                    time.sleep(0.1)
+                            continue
+                        except Exception as exc2:
+                            self.item_done.emit(sid, False, str(exc2), mailbox.address, False)
+                    else:
+                        self.item_done.emit(sid, False, str(exc), mailbox.address, False)
+                else:
+                    self.item_done.emit(sid, False, str(exc), mailbox.address, False)
             # 发信间隔（可被 stop 打断），最后一封不必等
             if i < total - 1 and not self._stopped:
                 deadline = time.time() + self.interval_seconds
@@ -163,3 +333,195 @@ class UpdateCheckWorker(QThread):
             self.result.emit(info, "")
         except Exception as exc:
             self.result.emit(None, str(exc))
+
+
+class ImportEditorsWorker(QThread):
+    """后台解析 CSV 并批量入库。"""
+
+    progress = Signal(int, int, str)
+    finished_ok = Signal(int, int)
+    failed = Signal(str)
+
+    def __init__(self, db, path: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.path = path
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        try:
+            editors = self._parse(self.path)
+        except Exception as exc:
+            _log.warning("导入编辑 CSV 失败", exc_info=True)
+            self.failed.emit(str(exc))
+            return
+        total = len(editors)
+        imported = skipped = 0
+        batch: list[Editor] = []
+        for i, editor in enumerate(editors, 1):
+            if self._stopped:
+                break
+            batch.append(editor)
+            if len(batch) >= 200 or i == total:
+                ok, skip = self.db.upsert_editors_bulk(batch)
+                imported += ok
+                skipped += skip
+                batch = []
+            self.progress.emit(i, max(total, 1), editor.email or editor.name or "")
+        self.finished_ok.emit(imported, skipped)
+
+    @staticmethod
+    def _parse(path: str) -> list[Editor]:
+        with open(path, "rb") as f:
+            raw = f.read()
+        text = None
+        for enc in ("utf-8-sig", "gbk"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise ValueError("无法识别文件编码")
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("文件为空或缺少列头")
+        header_map: dict[str, str] = {}
+        for field in reader.fieldnames:
+            key = (field or "").strip().lower()
+            for attr, aliases in _EDITOR_CSV_ALIASES.items():
+                if key in aliases:
+                    header_map[attr] = field
+        editors: list[Editor] = []
+        for row in reader:
+            email = (row.get(header_map.get("email", ""), "") or "").strip()
+            editors.append(Editor(
+                name=(row.get(header_map.get("name", ""), "") or "").strip() or email,
+                platform=(row.get(header_map.get("platform", ""), "") or "").strip(),
+                email=email,
+                genres=(row.get(header_map.get("genres", ""), "") or "").strip(),
+                directions=(row.get(header_map.get("directions", ""), "") or "").strip(),
+                status=(row.get(header_map.get("status", ""), "") or "").strip(),
+                fee_info=(row.get(header_map.get("fee_info", ""), "") or "").strip(),
+                source_url=(row.get(header_map.get("source_url", ""), "") or "").strip(),
+                notes=(row.get(header_map.get("notes", ""), "") or "").strip(),
+            ))
+        return editors
+
+
+class ImportManuscriptsWorker(QThread):
+    """后台读取文稿、复制到 files/ 并入库。"""
+
+    progress = Signal(int, int, str)
+    finished_ok = Signal(int, int, object)
+    failed = Signal(str)
+
+    def __init__(self, db, paths: list[str], parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.paths = list(paths)
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        from .docx_reader import read_docx_text, read_txt, count_cjk_words
+        ok = failed = 0
+        errors: list[str] = []
+        total = len(self.paths)
+        for i, path in enumerate(self.paths, 1):
+            if self._stopped:
+                break
+            name = os.path.basename(path)
+            self.progress.emit(i, max(total, 1), name)
+            try:
+                ext = os.path.splitext(path)[1].lower()
+                text = read_docx_text(path) if ext == ".docx" else read_txt(path)
+                copied = _copy_to_files_dir(self.db.files_dir, path)
+                self.db.insert_manuscript(Manuscript(
+                    title=os.path.splitext(name)[0], file_path=copied,
+                    word_count=count_cjk_words(text)))
+                ok += 1
+            except Exception as exc:
+                _log.warning("导入文稿失败 %s", path, exc_info=True)
+                failed += 1
+                errors.append(f"{name}：{exc}")
+        self.finished_ok.emit(ok, failed, errors)
+
+
+class DownloadUpdateWorker(QThread):
+    """后台下载安装包到本地临时目录。"""
+
+    progress = Signal(int, int)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url: str, dest_path: str, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.dest_path = dest_path
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        import urllib.error
+        import urllib.request
+        tmp_path = self.dest_path + ".part"
+        try:
+            req = urllib.request.Request(
+                self.url, headers={"User-Agent": "NailongPost-Updater/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                received = 0
+                os.makedirs(os.path.dirname(self.dest_path) or ".", exist_ok=True)
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        if self._stopped:
+                            try:
+                                f.close()
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                            self.failed.emit("已取消下载")
+                            return
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                        self.progress.emit(received, total)
+            if total and received != total:
+                self.failed.emit(f"文件大小不一致（{received}/{total}）")
+                return
+            os.replace(tmp_path, self.dest_path)
+            _log.info("更新包已下载 %s (%s 字节)", self.dest_path, received)
+            self.finished_ok.emit(self.dest_path)
+        except Exception as exc:
+            _log.warning("下载更新失败", exc_info=True)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            if isinstance(exc, urllib.error.URLError):
+                self.failed.emit(f"网络错误：{exc.reason}")
+            else:
+                self.failed.emit(str(exc))
+
+
+def _copy_to_files_dir(files_dir: str, src: str) -> str:
+    base = os.path.basename(src)
+    stem, ext = os.path.splitext(base)
+    dst = os.path.join(files_dir, base)
+    i = 1
+    while os.path.exists(dst):
+        dst = os.path.join(files_dir, f"{stem}_{i}{ext}")
+        i += 1
+    shutil.copy2(src, dst)
+    return dst

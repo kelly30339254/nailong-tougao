@@ -116,6 +116,13 @@ QLabel#cardTitle {
     font-weight: bold;
     color: #2E282C;
 }
+QWidget#pageBar {
+    background: transparent;
+}
+QLabel#pageBarText {
+    color: #8A8288;
+}
+
 QLabel#hintText {
     color: #A0989E;
     font-size: 12px;
@@ -399,6 +406,72 @@ QScrollBar::handle:horizontal:hover {
 }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
+}
+
+/* ---------- 登录 / 注册 ---------- */
+QDialog#authDialog {
+    background: #F3EEF2;
+}
+QFrame#authCard {
+    background: #FFFFFF;
+    border: none;
+}
+QLabel#authBrand {
+    font-size: 16px;
+    font-weight: bold;
+    color: {primary};
+}
+QLabel#authTitle {
+    font-size: 20px;
+    font-weight: bold;
+    color: #2E282C;
+}
+QLabel#authHint {
+    color: #8A8087;
+    font-size: 12px;
+}
+QLabel#authFieldLabel {
+    color: #5A5258;
+    font-size: 12px;
+    font-weight: bold;
+}
+QLabel#authError {
+    font-size: 12px;
+    min-height: 18px;
+    color: #E03131;
+}
+QLabel#authError[kind="ok"] { color: #2F9E44; }
+QLabel#authError[kind="info"] { color: #8A8087; }
+QLabel#authError[kind="error"] { color: #E03131; }
+QPushButton#authLink {
+    background: transparent;
+    border: none;
+    color: {primary};
+    padding: 2px 8px;
+    min-height: 0;
+}
+QPushButton#authLink:hover {
+    background: transparent;
+    border: none;
+    color: {primary_hover};
+}
+QPushButton#authGhost {
+    background: transparent;
+    border: none;
+    color: #A0989E;
+    min-height: 0;
+}
+QPushButton#authGhost:hover {
+    background: transparent;
+    border: none;
+    color: #5A5258;
+}
+QPushButton#authSecondary {
+    padding: 6px 10px;
+}
+QDialog#authDialog QLineEdit {
+    min-height: 28px;
+    padding: 6px 10px;
 }
 
 /* ---------- 其他 ---------- */

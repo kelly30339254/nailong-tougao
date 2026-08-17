@@ -1,13 +1,18 @@
 """主窗口：顶栏 + 侧栏导航 + QStackedWidget。"""
 from __future__ import annotations
 
+import os
+import sys
+
 from PySide6.QtCore import Qt, Signal, QUrl, QTimer, QSize
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
-    QComboBox, QListWidget, QListWidgetItem, QStackedWidget, QFrame,
-    QMessageBox,
+    QApplication, QDialog, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QLabel, QPushButton, QComboBox, QListWidget, QListWidgetItem,
+    QStackedWidget, QFrame, QMessageBox, QSystemTrayIcon, QMenu,
 )
+
+from .icons import app_icon
 
 from . import APP_VERSION
 from .theme import THEMES, DEFAULT_THEME, apply_theme
@@ -33,6 +38,7 @@ NAV_ITEMS = [
     ("records", "投递记录"),
     ("replies", "回信中心"),
     ("sales", "稿费记录"),
+    ("stats", "统计分析"),
     ("manuscripts", "文稿库"),
     ("editors", "编辑列表"),
     ("settings", "设置"),
@@ -122,6 +128,11 @@ class MainWindow(QMainWindow):
         # 启动 5 秒后后台检查新版本（静默，失败不打扰）
         self._update_worker = None
         QTimer.singleShot(5000, self.check_update)
+
+        # 关闭窗口最小化到系统托盘
+        self._force_quit = False
+        self._session_quit = False
+        self._setup_tray()
 
     # ---------- 顶栏 ----------
     def _build_topbar(self) -> QWidget:
@@ -219,6 +230,7 @@ class MainWindow(QMainWindow):
         from .pages.records import RecordsPage
         from .pages.replies import RepliesPage
         from .pages.sales import SalesPage
+        from .pages.stats import StatsPage
         constructors = {
             "settings": lambda: SettingsPage(self.db, self.store, self),
             "editors": lambda: EditorsPage(self.db, self.store, self),
@@ -228,15 +240,27 @@ class MainWindow(QMainWindow):
             "records": lambda: RecordsPage(self.db, self.store, self),
             "replies": lambda: RepliesPage(self.db, self.store, self),
             "sales": lambda: SalesPage(self.db, self.store, self),
+            "stats": lambda: StatsPage(self.db, self.store, self),
         }
         for page_id, title in NAV_ITEMS:
             page = constructors[page_id]()
             self._pages[page_id] = page
             self.stack.addWidget(page)
 
+    def set_replies_badge(self, count: int):
+        for row, pid in enumerate(self._nav_ids):
+            if pid != "replies":
+                continue
+            item = self.nav_list.item(row)
+            base = dict(NAV_ITEMS).get("replies", "回信中心")
+            item.setText(f"{base}（{count}）" if count else base)
+            break
+
     def navigate(self, page_id: str):
         if page_id not in self._pages:
             return
+        if page_id == "replies":
+            self.set_replies_badge(0)
         page = self._pages[page_id]
         self.stack.setCurrentWidget(page)
         row = self._nav_ids.index(page_id)
@@ -376,16 +400,81 @@ class MainWindow(QMainWindow):
         box.setText(f"发现新版本 {info['version']}（当前 {APP_VERSION}）")
         if info.get("notes"):
             box.setInformativeText(info["notes"])
-        download_btn = None
-        if info.get("download_url"):
-            download_btn = box.addButton("去下载", QMessageBox.AcceptRole)
-        ignore_btn = box.addButton("忽略此版本", QMessageBox.ActionRole)
+        github_url = (info.get("github_url") or "").strip()
+        download_url = (info.get("download_url") or "").strip()
+        inapp_btn = None
+        if github_url:
+            inapp_btn = box.addButton("应用内下载", QMessageBox.AcceptRole)
+        netdisk_btn = None
+        if download_url:
+            netdisk_btn = box.addButton("网盘下载", QMessageBox.ActionRole)
+        ignore_btn = box.addButton("忽略此版本", QMessageBox.DestructiveRole)
         box.addButton("下次再说", QMessageBox.RejectRole)
         box.exec()
-        if download_btn is not None and box.clickedButton() is download_btn:
-            QDesktopServices.openUrl(QUrl(info["download_url"]))
-        elif box.clickedButton() is ignore_btn:
+        clicked = box.clickedButton()
+        if inapp_btn is not None and clicked is inapp_btn:
+            self._download_update(github_url, info["version"])
+        elif netdisk_btn is not None and clicked is netdisk_btn:
+            QDesktopServices.openUrl(QUrl(download_url))
+        elif clicked is ignore_btn:
             self.store.set("ignored_version", info["version"])
+
+    def _download_update(self, url: str, version: str):
+        import tempfile
+        from urllib.parse import urlparse
+        from .widgets import ProgressDialog
+        from .workers import DownloadUpdateWorker
+
+        name = os.path.basename(urlparse(url).path) or f"nailong-{version}.bin"
+        dest = os.path.join(tempfile.gettempdir(), name)
+        dlg = ProgressDialog("下载更新", self)
+        worker = DownloadUpdateWorker(url, dest, self)
+
+        def on_progress(got: int, total: int):
+            if total:
+                dlg.set_progress(got, total, f"已下载 {got // 1024} / {total // 1024} KB")
+            else:
+                dlg.set_progress(1, 1, f"已下载 {got // 1024} KB")
+            if dlg.is_cancelled():
+                worker.stop()
+
+        def on_ok(path: str):
+            dlg.accept()
+            self._offer_install(path)
+
+        def on_fail(message: str):
+            dlg.reject()
+            if message != "已取消下载":
+                QMessageBox.warning(self, "下载失败", message)
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_ok)
+        worker.failed.connect(on_fail)
+        self._download_worker = worker
+        worker.start()
+        dlg.exec()
+        if dlg.is_cancelled() and worker.isRunning():
+            worker.stop()
+
+    def _offer_install(self, path: str):
+        box = QMessageBox(self)
+        box.setWindowTitle("下载完成")
+        box.setText("安装包已就绪，立即安装将退出当前程序。")
+        box.setInformativeText(path)
+        install_btn = box.addButton("立即安装", QMessageBox.AcceptRole)
+        box.addButton("稍后安装", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not install_btn:
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "无法启动安装包", str(exc))
+            return
+        self._quit_app()
 
     # ---------- 顶栏状态 ----------
     def _on_mail_badge_click(self, _event):
@@ -420,3 +509,110 @@ class MainWindow(QMainWindow):
         settings_page = self._pages.get("settings")
         if settings_page is not None and hasattr(settings_page, "sync_theme_selection"):
             settings_page.sync_theme_selection(name)
+
+    # ---------- 系统托盘 ----------
+    def _setup_tray(self):
+        """点击右上角×时最小化到托盘；托盘菜单提供「打开/退出」。"""
+        self._tray_icon = None
+        self._tray_menu = None
+        self._quitting = False
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return  # 系统无托盘则走正常关闭流程
+        app = QApplication.instance()
+        if app is not None:
+            # 窗口隐藏到托盘后不要因为「没有可见窗口」而自动退出
+            app.setQuitOnLastWindowClosed(False)
+            try:
+                app.commitDataRequest.connect(self._on_session_quit)
+            except Exception:
+                pass
+
+        icon = app_icon()
+        # 托盘和菜单都不挂在主窗口上：窗口隐藏后，子菜单点击在 Windows 上会丢事件
+        tray = QSystemTrayIcon(icon)
+        tray.setToolTip("奶龙投稿助手（点 × 会缩到这里，退出请用菜单「退出软件」）")
+        menu = QMenu()
+        open_action = menu.addAction("打开主界面")
+        open_action.triggered.connect(self._show_window)
+        menu.addSeparator()
+        quit_action = menu.addAction("退出软件")
+        # 等右键菜单先收起再退出；在菜单回调里立刻 hide 托盘，Windows 会把后续动作吞掉
+        quit_action.triggered.connect(lambda: QTimer.singleShot(0, self._quit_app))
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.show()
+        self._tray_menu = menu
+        self._tray_icon = tray
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_window()
+
+    def _show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self):
+        if self._quitting:
+            return
+        self._quitting = True
+        self._force_quit = True
+        tray = self._tray_icon
+        self._tray_icon = None
+        if tray is not None:
+            tray.setContextMenu(None)
+            tray.hide()
+            tray.deleteLater()
+        self._tray_menu = None
+
+        app = QApplication.instance()
+        if app is not None:
+            for w in list(app.topLevelWidgets()):
+                try:
+                    if isinstance(w, QDialog) and w.isVisible():
+                        w.reject()
+                except Exception:
+                    pass
+            self.close()
+            app.quit()
+
+        # 兜底：后台线程卡住事件循环时，仍保证托盘「退出」能结束进程
+        QTimer.singleShot(2000, lambda: os._exit(0))
+        import threading
+        threading.Timer(2.5, os._exit, args=(0,)).start()
+
+    def _on_session_quit(self, *_args):
+        """关机、注销或安装程序（Restart Manager）要求退出时，不要缩到托盘。"""
+        self._session_quit = True
+        self._quit_app()
+
+    def nativeEvent(self, eventType, message):
+        if sys.platform == "win32":
+            try:
+                kind = bytes(eventType)
+                if kind == b"windows_generic_MSG":
+                    import ctypes
+                    from ctypes import wintypes
+                    msg = wintypes.MSG.from_address(int(message))
+                    # WM_QUERYENDSESSION / WM_ENDSESSION：安装器或系统要关进程
+                    if msg.message in (0x0011, 0x0016):
+                        self._session_quit = True
+                        self._force_quit = True
+            except Exception:
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def closeEvent(self, event):
+        app = QApplication.instance()
+        if self._session_quit or (app is not None and app.isSavingSession()):
+            self._force_quit = True
+        # 点右上角×：拦截并最小化到托盘，后台继续接收回信/定时投稿
+        if self._tray_icon is not None and not self._force_quit:
+            event.ignore()
+            self.hide()
+            self._tray_icon.showMessage(
+                "奶龙投稿助手", "程序已最小化到托盘，点击图标可重新打开。",
+                QSystemTrayIcon.Information, 3000)
+            return
+        super().closeEvent(event)

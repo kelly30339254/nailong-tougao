@@ -115,8 +115,10 @@ class SettingsStore:
         if cfg.auth_code:
             if not credential_store.set(key, cfg.auth_code):
                 raise RuntimeError("无法安全保存邮箱授权码")
-        elif not credential_store.delete(key):
-            raise RuntimeError("无法删除邮箱授权码")
+        else:
+            # 授权码为空时尝试清理旧凭据；凭据系统不可用或没有旧凭据时
+            # 不应阻塞其他设置（如投稿信模板）的保存。
+            credential_store.delete(key)
         d = {
             "enabled": cfg.enabled, "provider": cfg.provider, "address": cfg.address,
             "display_name": cfg.display_name,
@@ -180,6 +182,46 @@ class SettingsStore:
     def save_letter_template(self, subject_tpl: str, body_tpl: str):
         self.set("letter_subject_tpl", subject_tpl)
         self.set("letter_body_tpl", body_tpl)
+
+    def get_letter_vary(self) -> bool:
+        return self.get("letter_vary", "1") == "1"
+
+    def save_letter_vary(self, enabled: bool):
+        self.set("letter_vary", "1" if enabled else "0")
+
+    def get_letter_ai_vary(self) -> bool:
+        return self.get("letter_ai_vary", "0") == "1"
+
+    def save_letter_ai_vary(self, enabled: bool):
+        self.set("letter_ai_vary", "1" if enabled else "0")
+
+    def get_urge_template(self) -> tuple[str, str]:
+        from .letter import DEFAULT_URGE_SUBJECT, DEFAULT_URGE_BODY
+        return (self.get("urge_subject_tpl") or DEFAULT_URGE_SUBJECT,
+                self.get("urge_body_tpl") or DEFAULT_URGE_BODY)
+
+    def save_urge_template(self, subject: str, body: str):
+        self.set("urge_subject_tpl", subject)
+        self.set("urge_body_tpl", body)
+
+    def get_ai_config(self):
+        from .ai_client import AiConfig, DEFAULT_PROVIDER, load_api_key, preset_for
+        provider = self.get("ai_provider", "") or DEFAULT_PROVIDER
+        preset_url, preset_model, _hint = preset_for(provider)
+        return AiConfig(
+            provider=provider,
+            base_url=self.get("ai_base_url", "") or preset_url,
+            model=self.get("ai_model", "") or preset_model,
+            api_key=load_api_key(),
+        )
+
+    def save_ai_config(self, provider: str, base_url: str, model: str, api_key: str):
+        from .ai_client import save_api_key
+        self.set("ai_provider", provider or "")
+        self.set("ai_base_url", (base_url or "").strip())
+        self.set("ai_model", (model or "").strip())
+        if not save_api_key(api_key):
+            raise RuntimeError("无法安全保存 API Key")
 
     # ---------- 收信配置 ----------
     def get_fetch_config(self) -> tuple[bool, int, int]:

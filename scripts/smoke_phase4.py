@@ -241,8 +241,8 @@ records_page.status_combo.setCurrentText("全部状态")
 
 # ---------- 设置页标签结构 ----------
 tabs = [settings_page.tabs.tabText(i) for i in range(settings_page.tabs.count())]
-check("设置页 7 标签顺序", tabs == ["发信邮箱", "投稿信模板", "投递策略",
-                                  "收信设置", "外观主题", "数据备份", "关于"])
+check("设置页标签顺序", tabs == ["账号", "发信邮箱", "投稿信模板", "AI 接口", "投递策略",
+                                "收信设置", "外观主题", "数据备份", "关于"])
 check("催稿天数加载", settings_page.urge_days_spin.value() == 30)
 
 print()

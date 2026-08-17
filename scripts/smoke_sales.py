@@ -111,7 +111,9 @@ badge_widget = manuscripts_page.table.cellWidget(1, 1)
 badge_label = badge_widget.findChild(QLabel) if badge_widget else None
 check("已售徽章出现", badge_label is not None and badge_label.text() == "已售")
 check("徽章 tooltip 详情（取最新一条售出）", "七猫" in (badge_label.toolTip() or ""))
-check("未售文稿无徽章", manuscripts_page.table.cellWidget(0, 1) is None)
+unsold = manuscripts_page.table.cellWidget(0, 1)
+unsold_label = unsold.findChild(QLabel) if unsold else None
+check("未售文稿显示未售徽章", unsold_label is not None and unsold_label.text() == "未售")
 
 # 行内"售出"按钮预选（patch exec：先走 _on_save 把表单写进 sale，再接受）
 orig_exec = SaleDialog.exec

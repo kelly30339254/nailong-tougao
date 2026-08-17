@@ -1,15 +1,15 @@
 """稿费记录页：售出登记（平台/编辑/金额/打款日期）+ 列表 + 统计。"""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import Qt, QDate, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
-    QPushButton, QTableWidget, QDialog, QFormLayout, QMessageBox,
-    QAbstractItemView, QHeaderView, QPlainTextEdit, QDateEdit,
+    QPushButton, QDialog, QFormLayout, QMessageBox,
+    QHeaderView, QPlainTextEdit, QDateEdit, QCheckBox,
 )
 
 from ..models import Sale
-from ..widgets import mk_item
+from ..widgets import mk_item, PagedTable, export_csv
 
 
 class SaleDialog(QDialog):
@@ -128,73 +128,124 @@ class SalesPage(QWidget):
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(10)
 
-        # 头部：统计 + 新增按钮
+        # 头部：统计 + 搜索 + 新增
         top = QHBoxLayout()
         self.summary_label = QLabel()
         self.summary_label.setObjectName("hintText")
         top.addWidget(self.summary_label)
-        top.addStretch()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索文稿 / 平台 / 编辑…")
+        self.search_edit.setClearButtonEnabled(True)
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(200)
+        self._search_debounce.timeout.connect(self._on_filter_changed)
+        self.search_edit.textChanged.connect(lambda *_a: self._search_debounce.start())
+        top.addWidget(self.search_edit, 1)
+        self.use_date = QCheckBox("按售出日期")
+        self.use_date.toggled.connect(self._on_filter_changed)
+        top.addWidget(self.use_date)
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        self.date_from.setDate(QDate.currentDate().addMonths(-3))
+        self.date_from.dateChanged.connect(self._on_filter_changed)
+        top.addWidget(self.date_from)
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        self.date_to.setDate(QDate.currentDate())
+        self.date_to.dateChanged.connect(self._on_filter_changed)
+        top.addWidget(self.date_to)
+        export_btn = QPushButton("导出 CSV")
+        export_btn.clicked.connect(self._on_export)
+        top.addWidget(export_btn)
+        self.batch_delete_btn = QPushButton("批量删除")
+        self.batch_delete_btn.setEnabled(False)
+        self.batch_delete_btn.clicked.connect(self._on_batch_delete)
+        top.addWidget(self.batch_delete_btn)
         add_btn = QPushButton("新增售出记录")
         add_btn.setObjectName("primaryBtn")
         add_btn.clicked.connect(self._on_add)
         top.addWidget(add_btn)
         layout.addLayout(top)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(
-            ["文稿", "平台", "编辑", "稿费(元)", "售出日期", "打款日期", "备注", "操作"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(36)
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.paged = PagedTable(
+            ["文稿", "平台", "编辑", "稿费(元)", "售出日期", "打款日期", "备注", "操作"],
+            sort_keys=["title", "platform", "editor_name", "amount",
+                       "sale_date", "payment_date", "notes", None],
+            action_cols={7},
+            empty_text="还没有售出记录，过稿之后来记一笔",
+            store=store,
+            width_key="table_widths_sales",
+        )
+        self.table = self.paged.table
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
         self.table.setColumnWidth(7, 120)
         header.setStretchLastSection(False)
-        layout.addWidget(self.table, 1)
+        self.paged.set_loader(self._fetch)
+        self.paged.set_binder(self._bind_row)
+        self.paged.selection_changed.connect(self._update_batch_btns)
+        layout.addWidget(self.paged, 1)
 
         self.refresh()
 
     def refresh(self):
         count, total = self.db.sales_summary()
         self.summary_label.setText(f"已售出 {count} 篇 · 稿费合计 {total:g} 元")
+        self._reload(reset_page=False)
 
-        sales = self.db.list_sales()
-        self.table.setRowCount(0)
-        if not sales:
-            self.table.setRowCount(1)
-            item = mk_item("还没有售出记录，过稿之后来记一笔", Qt.AlignCenter)
-            item.setForeground(Qt.gray)
-            self.table.setItem(0, 0, item)
-            self.table.setSpan(0, 0, 1, 8)
-            return
+    def _on_filter_changed(self):
+        self._reload(reset_page=True)
 
-        self.table.setRowCount(len(sales))
-        for row, s in enumerate(sales):
-            payment_text = s.payment_date or (
-                f"{s.payment_month}（仅月份）" if s.payment_month else "")
-            values = [s.manuscript_title or "（文稿已删除）", s.platform, s.editor_name,
-                      "" if s.amount is None else f"{s.amount:g}",
-                      s.sale_date, payment_text, s.notes]
-            for col, text in enumerate(values):
-                self.table.setItem(row, col, mk_item(text or ""))
+    def _date_range(self):
+        if not self.use_date.isChecked():
+            return None, None
+        return (self.date_from.date().toString("yyyy-MM-dd"),
+                self.date_to.date().toString("yyyy-MM-dd"))
 
-            ops = QWidget()
-            ops_layout = QHBoxLayout(ops)
-            ops_layout.setContentsMargins(2, 0, 2, 0)
-            ops_layout.setSpacing(4)
-            edit_btn = QPushButton("编辑")
-            edit_btn.setObjectName("iconBtn")
-            edit_btn.clicked.connect(lambda _=False, sale=s: self._on_edit(sale))
-            ops_layout.addWidget(edit_btn)
-            del_btn = QPushButton("删除")
-            del_btn.setObjectName("iconBtn")
-            del_btn.setStyleSheet("color: #E03131;")
-            del_btn.clicked.connect(lambda _=False, sale=s: self._on_delete(sale))
-            ops_layout.addWidget(del_btn)
-            self.table.setCellWidget(row, 7, ops)
+    def _fetch(self, offset, limit, order_by, desc):
+        date_from, date_to = self._date_range()
+        return self.db.list_sales_page(
+            keyword=self.search_edit.text().strip() or None,
+            date_from=date_from, date_to=date_to,
+            offset=offset, limit=limit, order_by=order_by, desc=desc)
+
+    def _reload(self, reset_page: bool = True):
+        self.paged.reload(reset_page=reset_page)
+        self._update_batch_btns()
+
+    def _update_batch_btns(self):
+        self.batch_delete_btn.setEnabled(bool(self.paged.selected_items()))
+
+    def _bind_row(self, table, row, s):
+        payment_text = s.payment_date or (
+            f"{s.payment_month}（仅月份）" if s.payment_month else "")
+        values = [s.manuscript_title or "（文稿已删除）", s.platform, s.editor_name,
+                  "" if s.amount is None else f"{s.amount:g}",
+                  s.sale_date, payment_text, s.notes]
+        for col, text in enumerate(values):
+            item = mk_item(text or "")
+            if col == 0:
+                item.setData(Qt.UserRole, s.id)
+            table.setItem(row, col, item)
+
+        ops = QWidget()
+        ops_layout = QHBoxLayout(ops)
+        ops_layout.setContentsMargins(2, 0, 2, 0)
+        ops_layout.setSpacing(4)
+        edit_btn = QPushButton("编辑")
+        edit_btn.setObjectName("iconBtn")
+        edit_btn.clicked.connect(lambda _=False, sale=s: self._on_edit(sale))
+        ops_layout.addWidget(edit_btn)
+        del_btn = QPushButton("删除")
+        del_btn.setObjectName("iconBtn")
+        del_btn.setStyleSheet("color: #E03131;")
+        del_btn.clicked.connect(lambda _=False, sale=s: self._on_delete(sale))
+        ops_layout.addWidget(del_btn)
+        table.setCellWidget(row, 7, ops)
 
     def _on_add(self):
         dlg = SaleDialog(self.db, self)
@@ -218,3 +269,34 @@ class SalesPage(QWidget):
             self.db.delete_sale(sale.id)
             self.main_window.data_changed.emit()
             self.refresh()
+
+    def _on_batch_delete(self):
+        items = self.paged.selected_items()
+        if not items:
+            return
+        ret = QMessageBox.question(
+            self, "批量删除",
+            f"确定删除选中的 {len(items)} 条售出记录吗？此操作不可恢复。")
+        if ret != QMessageBox.Yes:
+            return
+        self.db.delete_sales([s.id for s in items])
+        self.main_window.data_changed.emit()
+        self.refresh()
+
+    def _on_export(self):
+        date_from, date_to = self._date_range()
+        _total, sales = self.db.list_sales_page(
+            keyword=self.search_edit.text().strip() or None,
+            date_from=date_from, date_to=date_to,
+            offset=0, limit=100000, order_by="id", desc=True)
+        rows = []
+        for s in sales:
+            payment_text = s.payment_date or (
+                f"{s.payment_month}（仅月份）" if s.payment_month else "")
+            rows.append([
+                s.manuscript_title or "", s.platform, s.editor_name,
+                "" if s.amount is None else f"{s.amount:g}",
+                s.sale_date, payment_text, s.notes,
+            ])
+        export_csv(self, ["文稿", "平台", "编辑", "稿费(元)", "售出日期", "打款日期", "备注"],
+                   rows, "稿费记录.csv")

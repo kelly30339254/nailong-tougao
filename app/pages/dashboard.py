@@ -39,9 +39,13 @@ def _relative_time(time_str: str) -> str:
 
 
 class StatCard(QFrame):
-    def __init__(self, title: str):
+    def __init__(self, title: str, on_click=None):
         super().__init__()
         self.setObjectName("card")
+        self._on_click = on_click
+        if on_click:
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip(f"查看{title}")
         outer = QHBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 14)
         outer.setSpacing(10)
@@ -63,6 +67,11 @@ class StatCard(QFrame):
     def set_value(self, value: int):
         self.number.setText(str(value))
 
+    def mousePressEvent(self, event):
+        if self._on_click and event.button() == Qt.LeftButton:
+            self._on_click()
+        super().mousePressEvent(event)
+
 
 class DashboardPage(QWidget):
     def __init__(self, db, store, main_window):
@@ -80,8 +89,13 @@ class DashboardPage(QWidget):
         stats_row = QHBoxLayout()
         stats_row.setSpacing(12)
         self.stat_cards: dict[str, StatCard] = {}
+        _stat_nav = {
+            "编辑总数": "editors", "文稿": "manuscripts", "待回复": "records",
+            "过稿": "replies", "退稿": "replies", "未读回信": "replies",
+        }
         for key in STAT_KEYS:
-            card = StatCard(key)
+            target = _stat_nav[key]
+            card = StatCard(key, on_click=lambda page=target: self.main_window.navigate(page))
             self.stat_cards[key] = card
             stats_row.addWidget(card, 1)
         layout.addLayout(stats_row)
@@ -326,6 +340,7 @@ class DashboardPage(QWidget):
         if not editor_emails:
             return
         self._fetch_failures: list[tuple[str, str]] = []
+        self._fetch_new = 0
         self._fetch_worker = FetchWorker(mailboxes, editor_emails, lookback_days, self)
         self._fetch_worker.mailbox_result.connect(self._on_mailbox_result)
         self._fetch_worker.mailbox_failed.connect(self._on_mailbox_failed)
@@ -334,7 +349,8 @@ class DashboardPage(QWidget):
 
     def _on_mailbox_result(self, address: str, results: list):
         """主线程写库：去重 insert replies、匹配 submissions 回写 reply_status。"""
-        ingest_results(self.db, address, results)
+        res = ingest_results(self.db, address, results)
+        self._fetch_new = getattr(self, "_fetch_new", 0) + res.new_replies
 
     def _on_mailbox_failed(self, address: str, error: str):
         self._fetch_failures.append((address, error))
@@ -351,3 +367,10 @@ class DashboardPage(QWidget):
         self.main_window.data_changed.emit()
         if self.main_window.stack.currentWidget() is not self:
             self.refresh()
+        new_n = getattr(self, "_fetch_new", 0)
+        if new_n and self.store.get("notify_replies", "1") != "0":
+            if self.main_window._tray_icon is not None:
+                self.main_window._tray_icon.showMessage(
+                    "奶龙投稿助手", f"收到 {new_n} 封新回信",
+                    self.main_window._tray_icon.Information, 4000)
+            self.main_window.set_replies_badge(new_n)

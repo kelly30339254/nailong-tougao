@@ -142,6 +142,7 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
             reference_ids = _decode_str(msg.get("References", "")).strip()
             is_auto_reply = _is_auto_reply(msg, subject)
             body = _extract_body(msg)
+            body_full = (body or "")[:50000]
             snippet = re.sub(r"\s+", " ", body).strip()[:300]
             bounce = _is_bounce(from_email, subject)
             if not bounce and from_email not in editor_emails:
@@ -162,6 +163,7 @@ def fetch_replies(mailbox: MailboxConfig, editor_emails: set, lookback_days: int
                 "from_email": from_email,
                 "subject": subject,
                 "snippet": snippet,
+                "body_full": body_full,
                 "uid": uid,
                 "mailbox_address": mailbox.address,
                 "imap_folder": "INBOX",

@@ -111,7 +111,7 @@ def test_mailbox(mailbox: MailboxConfig) -> tuple[bool, str]:
     if not mailbox.imap_host:
         return False, "SMTP 登录成功；但未填写 IMAP 主机，无法收信"
     try:
-        imap = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port)
+        imap = imaplib.IMAP4_SSL(mailbox.imap_host, mailbox.imap_port, timeout=15)
         try:
             imap.login(mailbox.address, mailbox.auth_code)
         finally:

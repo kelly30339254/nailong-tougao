@@ -16,11 +16,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Editor
-from ..widgets import mk_item
+from ..widgets import mk_item, ProgressDialog
 from ..icons import make_icon
 from ..theme import theme_colors
 from .. import updater
-from ..workers import SyncEditorsWorker
+from ..workers import SyncEditorsWorker, ImportEditorsWorker
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DIRECTIONS_PREVIEW_LENGTH = 5
@@ -176,6 +176,14 @@ class EditorsPage(QWidget):
         export_btn = QPushButton("导出CSV")
         export_btn.clicked.connect(self._on_export)
         action_row.addWidget(export_btn)
+        self.batch_bl_btn = QPushButton("批量加入小黑屋")
+        self.batch_bl_btn.setEnabled(False)
+        self.batch_bl_btn.clicked.connect(lambda: self._on_batch_blacklist(True))
+        action_row.addWidget(self.batch_bl_btn)
+        self.batch_unbl_btn = QPushButton("批量移出小黑屋")
+        self.batch_unbl_btn.setEnabled(False)
+        self.batch_unbl_btn.clicked.connect(lambda: self._on_batch_blacklist(False))
+        action_row.addWidget(self.batch_unbl_btn)
         add_btn = QPushButton("新增")
         add_btn.setObjectName("primaryBtn")
         add_btn.clicked.connect(self._on_add)
@@ -201,7 +209,9 @@ class EditorsPage(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.itemSelectionChanged.connect(self._update_batch_btns)
         header = self.table.horizontalHeader()
         # 普通文本列的宽度在填充数据后一次性测量并固定；窗口不够时由
         # 横向滚动条承载，避免 Qt 的 ResizeToContents 在数千行数据上反复扫描。
@@ -218,7 +228,7 @@ class EditorsPage(QWidget):
         header.setSectionResizeMode(9, QHeaderView.Fixed)
         self.table.setColumnWidth(9, 64)
         header.setSectionResizeMode(10, QHeaderView.Fixed)
-        self.table.setColumnWidth(10, 200)
+        self.table.setColumnWidth(10, 260)
         header.setStretchLastSection(False)
         layout.addWidget(self.table, 1)
 
@@ -323,6 +333,7 @@ class EditorsPage(QWidget):
         self._update_pager(total, pages)
 
         self.table.setRowCount(0)
+        self._row_editors = []
         if not editors:
             self.table.setRowCount(1)
             item = QTableWidgetItem("没有匹配的编辑")
@@ -330,6 +341,7 @@ class EditorsPage(QWidget):
             item.setForeground(Qt.gray)
             self.table.setItem(0, 0, item)
             self.table.setSpan(0, 0, 1, 11)
+            self._update_batch_btns()
             return
 
         self.table.setRowCount(len(editors))
@@ -357,6 +369,8 @@ class EditorsPage(QWidget):
                               (4, e.genres), (5, directions_preview),
                               (7, e.fee_info)):
                 item = mk_item(text or "")
+                if col == 1:
+                    item.setData(Qt.UserRole, e.id)
                 if col == 3 and e.email_invalid:
                     item.setForeground(Qt.red)
                     item.setToolTip("该邮箱投递被退回，已自动跳过")
@@ -406,6 +420,10 @@ class EditorsPage(QWidget):
                 restore_btn.setStyleSheet("color: #2F9E44;")
                 restore_btn.clicked.connect(lambda _=False, eid=e.id: self._on_restore_valid(eid))
                 ops_layout.addWidget(restore_btn)
+            ai_btn = QPushButton("AI解读")
+            ai_btn.setObjectName("iconBtn")
+            ai_btn.clicked.connect(lambda _=False, ed=e: self._on_ai_summary(ed))
+            ops_layout.addWidget(ai_btn)
             edit_btn = QPushButton("编辑")
             edit_btn.setObjectName("iconBtn")
             edit_btn.clicked.connect(lambda _=False, ed=e: self._on_edit(ed))
@@ -419,6 +437,7 @@ class EditorsPage(QWidget):
 
         # 列宽按全量（非当前页）测量：翻页/切筛选时列宽不再跳动
         self._fit_text_columns(all_editors)
+        self._update_batch_btns()
 
         # 右键菜单：收藏 / 小黑屋 / 编辑 / 删除
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -436,6 +455,7 @@ class EditorsPage(QWidget):
                        lambda: self._toggle_blacklist(e.id))
         if e.email_invalid:
             menu.addAction("恢复邮箱有效", lambda: self._on_restore_valid(e.id))
+        menu.addAction("AI解读", lambda: self._on_ai_summary(e))
         menu.addAction("编辑", lambda: self._on_edit(e))
         menu.addAction("删除", lambda: self._on_delete(e))
         menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -467,12 +487,62 @@ class EditorsPage(QWidget):
         return wrap
 
     # ---------- 行内操作 ----------
+    def _on_ai_summary(self, editor: Editor):
+        from ..ai_ui import require_ai_config
+        from ..workers import AiCallWorker
+        from .. import ai_smart
+        cfg = require_ai_config(self, self.store, self.main_window)
+        if cfg is None:
+            return
+        self._ai_worker = AiCallWorker(
+            lambda: ai_smart.summarize_editor(cfg, editor), self)
+
+        def ok(info: dict):
+            QMessageBox.information(
+                self, f"AI解读 · {editor.name}",
+                f"{info.get('summary') or '（无摘要）'}\n\n"
+                f"适合度：{info.get('fit')}\n"
+                f"{info.get('reason') or ''}\n\n"
+                "仅供参考，投稿前请核对该编辑来源链接。")
+
+        def fail(msg):
+            QMessageBox.warning(self, "AI解读失败", str(msg))
+
+        self._ai_worker.finished_ok.connect(ok)
+        self._ai_worker.failed.connect(fail)
+        self._ai_worker.start()
+
     def _toggle_fav(self, editor_id: int):
         self.db.toggle_favorite(editor_id)
         self._reload_table()
 
     def _toggle_blacklist(self, editor_id: int):
         self.db.toggle_blacklisted(editor_id)
+        self._reload_table()
+
+    def _selected_editors(self) -> list[Editor]:
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        editors = getattr(self, "_row_editors", [])
+        return [editors[r] for r in rows if 0 <= r < len(editors)]
+
+    def _update_batch_btns(self):
+        selected = self._selected_editors()
+        enabled = bool(selected)
+        if hasattr(self, "batch_bl_btn"):
+            self.batch_bl_btn.setEnabled(enabled)
+            self.batch_unbl_btn.setEnabled(enabled)
+
+    def _on_batch_blacklist(self, blacklisted: bool):
+        selected = self._selected_editors()
+        if not selected:
+            return
+        verb = "加入小黑屋" if blacklisted else "移出小黑屋"
+        ret = QMessageBox.question(
+            self, verb, f"确定将选中的 {len(selected)} 位编辑{verb}？")
+        if ret != QMessageBox.Yes:
+            return
+        self.db.set_blacklisted_many([e.id for e in selected], blacklisted)
+        self.main_window.data_changed.emit()
         self._reload_table()
 
     def _on_restore_valid(self, editor_id: int):
@@ -499,8 +569,11 @@ class EditorsPage(QWidget):
             self.refresh()
 
     def _on_delete(self, editor: Editor):
-        ret = QMessageBox.question(self, "确认删除",
-                                   f"确定删除编辑「{editor.name}」吗？此操作不可恢复。")
+        n_sub, n_rep = self.db.count_editor_related(editor.id)
+        ret = QMessageBox.question(
+            self, "确认删除",
+            f"删除该编辑将连带删除 {n_sub} 条投递记录和 {n_rep} 封回信，且不可恢复。\n"
+            f"确定删除「{editor.name}」吗？")
         if ret == QMessageBox.Yes:
             self.db.delete_editor(editor.id)
             self.main_window.data_changed.emit()
@@ -511,55 +584,34 @@ class EditorsPage(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "导入编辑 CSV", "", "CSV 文件 (*.csv)")
         if not path:
             return
-        with open(path, "rb") as f:
-            raw = f.read()
-        text = None
-        for enc in ("utf-8-sig", "gbk"):
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if text is None:
-            QMessageBox.warning(self, "导入失败", "无法识别文件编码")
-            return
+        dlg = ProgressDialog("导入编辑", self)
+        worker = ImportEditorsWorker(self.db, path, self)
 
-        reader = csv.DictReader(io.StringIO(text))
-        if not reader.fieldnames:
-            QMessageBox.warning(self, "导入失败", "文件为空或缺少列头")
-            return
-        # 列头别名映射（小写去空格）
-        header_map: dict[str, str] = {}
-        for field in reader.fieldnames:
-            key = (field or "").strip().lower()
-            for attr, aliases in _HEADER_ALIASES.items():
-                if key in aliases:
-                    header_map[attr] = field
+        def on_progress(i, n, text):
+            dlg.set_progress(i, n, f"正在导入第 {i}/{n} 条：{text}")
+            if dlg.is_cancelled():
+                worker.stop()
 
-        imported = skipped = 0
-        for row in reader:
-            email = (row.get(header_map.get("email", ""), "") or "").strip()
-            if not email:
-                skipped += 1
-                continue
-            editor = Editor(
-                name=(row.get(header_map.get("name", ""), "") or "").strip() or email,
-                platform=(row.get(header_map.get("platform", ""), "") or "").strip(),
-                email=email,
-                genres=(row.get(header_map.get("genres", ""), "") or "").strip(),
-                directions=(row.get(header_map.get("directions", ""), "") or "").strip(),
-                status=(row.get(header_map.get("status", ""), "") or "").strip(),
-                fee_info=(row.get(header_map.get("fee_info", ""), "") or "").strip(),
-                source_url=(row.get(header_map.get("source_url", ""), "") or "").strip(),
-                notes=(row.get(header_map.get("notes", ""), "") or "").strip(),
-            )
-            self.db.insert_editor(editor)
-            imported += 1
+        def on_done(imported, skipped):
+            dlg.accept()
+            self.main_window.data_changed.emit()
+            self.refresh()
+            QMessageBox.information(
+                self, "导入完成",
+                f"成功导入 {imported} 条，跳过 {skipped} 条（邮箱为空或重复）。")
 
-        self.main_window.data_changed.emit()
-        self.refresh()
-        QMessageBox.information(self, "导入完成",
-                                f"成功导入 {imported} 条，跳过 {skipped} 条（邮箱为空）。")
+        def on_fail(msg):
+            dlg.reject()
+            QMessageBox.warning(self, "导入失败", str(msg))
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_fail)
+        self._import_worker = worker
+        worker.start()
+        dlg.exec()
+        if dlg.is_cancelled() and worker.isRunning():
+            worker.stop()
 
     def _on_export(self):
         editors = self._current_editors()
