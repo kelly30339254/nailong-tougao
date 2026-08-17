@@ -57,24 +57,41 @@ def main():
     # 单实例保护：双开第二个实例直接提示退出，避免争用数据库报 database is locked
     import socket
     from PySide6.QtCore import QLockFile
+    from PySide6.QtWidgets import QMessageBox
     from app.db import data_dir
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("奶龙投稿助手")
+
     lock = QLockFile(os.path.join(data_dir(), "app.lock"))
     lock.setStaleLockTime(5000)
 
-    def _pid_alive(pid: int) -> bool:
+    def _pid_is_our_app(pid: int) -> bool:
+        """该 PID 是否是我们程序的活进程。进程名查不到时保守当作是。"""
         if pid <= 0:
             return False
-        if sys.platform == "win32":
-            import ctypes
-            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if h:
-                ctypes.windll.kernel32.CloseHandle(h)
-            return bool(h)
+        if sys.platform != "win32":
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+        import ctypes
+        from ctypes import wintypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return False  # 进程已不存在
         try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(512)
+            if not ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size)):
+                return True  # 无权查询（系统进程等），保守当作是
+            name = os.path.basename(buf.value).lower()
+            # 打包后是「奶龙投稿助手.exe」，开发时是 python
+            return name in ("奶龙投稿助手.exe", "python.exe", "pythonw.exe")
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
 
     def _lock_is_bogus() -> bool:
         """Qt 的过期锁判定很保守：主机名不同、锁文件损坏读不出信息时
@@ -84,14 +101,14 @@ def main():
             return True  # 锁文件损坏/0 字节（如拷贝中断、网盘同步占位）
         if hostname.lower() != socket.gethostname().lower():
             return True  # 从别的电脑整体拷来的数据目录
-        return not _pid_alive(pid)  # 本机进程已不存在（崩溃残留）
+        # 主机名相同（新电脑常沿用旧电脑名）时，仅凭 PID 存活不可靠：
+        # 可能是撞名的无关进程，需核对进程名是不是本程序
+        return not _pid_is_our_app(pid)
 
     if not lock.tryLock(100) and _lock_is_bogus():
         lock.removeStaleLockFile()
         lock.tryLock(100)
     if not lock.isLocked():
-        app = QApplication(sys.argv)
-        from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(QMessageBox.Warning, "奶龙投稿助手",
                           "程序已在运行，请勿重复打开。\n\n"
                           "如果刚从别的电脑迁移数据、或上次异常退出，"
@@ -104,9 +121,6 @@ def main():
         # 用户确认没有别的实例在跑：删掉锁文件强行接管
         lock.removeStaleLockFile()
         lock.tryLock(100)
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("奶龙投稿助手")
     if not lic.is_activated():
         from app.activation_dialog import ActivationDialog
         if ActivationDialog().exec() != QDialog.Accepted:
