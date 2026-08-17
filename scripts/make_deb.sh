@@ -39,3 +39,9 @@ EOF
 OUT="奶龙投稿助手-${VER}-linux-amd64.deb"
 dpkg-deb --build "$PKG" "$OUT" > /dev/null
 echo "[完成] 产物：$OUT"
+
+# 便携包：单文件二进制压缩成 zip，解压即可运行
+ZIP_OUT="奶龙投稿助手-${VER}-linux-amd64.zip"
+rm -f "$ZIP_OUT"
+(cd dist && zip "../$ZIP_OUT" "奶龙投稿助手")
+echo "[完成] 产物：$ZIP_OUT"

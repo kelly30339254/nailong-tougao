@@ -16,3 +16,9 @@ ln -s /Applications build/dmg/Applications
 OUT="奶龙投稿助手-${VER}-macos.dmg"
 hdiutil create -volname "奶龙投稿助手" -srcfolder build/dmg -ov -format UDZO "$OUT"
 echo "[完成] 产物：$OUT"
+
+# 便携包：.app 直接压缩成 zip，解压即可用（-y 保留符号链接）
+ZIP_OUT="奶龙投稿助手-${VER}-macos.zip"
+rm -f "$ZIP_OUT"
+(cd dist && zip -r -y "../$ZIP_OUT" "奶龙投稿助手.app")
+echo "[完成] 产物：$ZIP_OUT"

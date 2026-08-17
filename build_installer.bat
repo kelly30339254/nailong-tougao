@@ -1,12 +1,12 @@
 @echo off
-rem å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹ â€” Windows å®‰è£…ç‰ˆæ‰“åŒ…ï¼ˆPyInstaller + Inno Setupï¼ŒåŒå‡»è¿è¡Œï¼‰
-rem äº§ç‰©ï¼šdist\å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹-<ç‰ˆæœ¬>-windows-setup.exe
+rem ÄÌÁúÍ¶¸åÖúÊÖ ¡ª Windows °²×°°æ´ò°ü£¨PyInstaller + Inno Setup£¬Ë«»÷ÔËĞĞ£©
+rem ²úÎï£ºdist\ÄÌÁúÍ¶¸åÖúÊÖ-<°æ±¾>-windows-setup.exe
 cd /d "%~dp0"
 
-set PYI=.venv\Scripts\pyinstaller.exe
+rem ×¢Òâ£ºpyinstaller.exe °ü×°Æ÷ÔÚÖĞÎÄÂ·¾¶ÏÂ»á¾²Ä¬Ê§°Ü£¬Í³Ò»ÓÃ python -m PyInstaller
 set PY=.venv\Scripts\python.exe
-if not exist %PYI% (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° %PYI%ï¼Œè¯·å…ˆåˆ›å»º .venv å¹¶å®‰è£… pyinstaller
+if not exist %PY% (
+    echo [´íÎó] Î´ÕÒµ½ %PY%£¬ÇëÏÈ´´½¨ .venv ²¢°²×° pyinstaller
     pause
     exit /b 1
 )
@@ -16,30 +16,30 @@ if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Fil
 if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
 if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 if not defined ISCC (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° Inno Setup 6ï¼Œè¯·å…ˆå®‰è£…ï¼šwinget install JRSoftware.InnoSetup
+    echo [´íÎó] Î´ÕÒµ½ Inno Setup 6£¬ÇëÏÈ°²×°£ºwinget install JRSoftware.InnoSetup
     pause
     exit /b 1
 )
 
 for /f %%v in ('%PY% -c "from app import APP_VERSION; print(APP_VERSION)"') do set VER=%%v
-echo [ä¿¡æ¯] ç‰ˆæœ¬å·ï¼š%VER%
+echo [ĞÅÏ¢] °æ±¾ºÅ£º%VER%
 
-rem ç¬¬ä¸€æ­¥ï¼šPyInstaller æ‰“å•æ–‡ä»¶ exeï¼ˆèµ° .specï¼Œå·²å…³é—­ UPXï¼‰
-%PYI% --noconfirm --clean "å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹.spec"
+rem µÚÒ»²½£ºPyInstaller ´òµ¥ÎÄ¼ş exe£¨×ß .spec£¬ÒÑ¹Ø±Õ UPX£©
+%PY% -m PyInstaller --noconfirm --clean "ÄÌÁúÍ¶¸åÖúÊÖ.spec"
 if errorlevel 1 (
-    echo [é”™è¯¯] PyInstaller æ‰“åŒ…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹è¾“å‡º
+    echo [´íÎó] PyInstaller ´ò°üÊ§°Ü£¬Çë¼ì²éÉÏ·½Êä³ö
     pause
     exit /b 1
 )
 
-rem ç¬¬äºŒæ­¥ï¼šInno Setup ç”Ÿæˆå®‰è£…ç¨‹åº
+rem µÚ¶ş²½£ºInno Setup Éú³É°²×°³ÌĞò
 "%ISCC%" /DAppVersion=%VER% installer.iss
 if errorlevel 1 (
-    echo [é”™è¯¯] Inno Setup æ‰“åŒ…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹è¾“å‡º
+    echo [´íÎó] Inno Setup ´ò°üÊ§°Ü£¬Çë¼ì²éÉÏ·½Êä³ö
     pause
     exit /b 1
 )
 
 echo.
-echo [å®Œæˆ] äº§ç‰©ï¼šdist\å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹-%VER%-windows-setup.exe
+echo [Íê³É] ²úÎï£ºdist\ÄÌÁúÍ¶¸åÖúÊÖ-%VER%-windows-setup.exe
 pause

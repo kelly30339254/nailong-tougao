@@ -55,10 +55,17 @@ def main():
         sys.exit(smoke())
 
     # 单实例保护：双开第二个实例直接提示退出，避免争用数据库报 database is locked
+    import socket
     from PySide6.QtCore import QLockFile
     from app.db import data_dir
     lock = QLockFile(os.path.join(data_dir(), "app.lock"))
     lock.setStaleLockTime(5000)
+    if not lock.tryLock(100):
+        # 数据目录从别的电脑整体拷来时，app.lock 里的主机名与本机不同，
+        # Qt 不会把这种锁视为过期锁，会永远误判「已在运行」，需手动清除后重试
+        _pid, hostname, _appname = lock.getLockInfo()
+        if hostname and hostname.lower() != socket.gethostname().lower():
+            lock.removeStaleLockFile()
     if not lock.tryLock(100):
         app = QApplication(sys.argv)
         from PySide6.QtWidgets import QMessageBox

@@ -39,7 +39,8 @@ def save_ledger(ledger: dict):
         json.dump(ledger, f, ensure_ascii=False, indent=1)
 
 
-def cmd_import(path: str) -> int:
+def import_file(path: str) -> tuple[int, int]:
+    """导入卡密文件（幂等），返回（新增数量，台账总数）。"""
     ledger = load_ledger()
     # 序号决定 give 的取卡顺序：按导入批次先后 + 文件内顺序，与生成文件一致
     seq = max((v.get("seq", 0) for v in ledger.values()), default=0)
@@ -56,7 +57,12 @@ def cmd_import(path: str) -> int:
                                "seq": seq}
                 added += 1
     save_ledger(ledger)
-    print(f"导入完成：新增 {added} 张，台账共 {len(ledger)} 张")
+    return added, len(ledger)
+
+
+def cmd_import(path: str) -> int:
+    added, total = import_file(path)
+    print(f"导入完成：新增 {added} 张，台账共 {total} 张")
     return 0
 
 
@@ -67,45 +73,80 @@ def _stock_in_order(ledger: dict) -> list[str]:
         key=lambda kv: kv[1].get("seq", 0))]
 
 
-def cmd_give(count: int, note: str) -> int:
+def give_keys(count: int, note: str) -> list[str]:
+    """取 count 张库存卡密并标记为已发放，返回取到的卡密列表。
+
+    库存不足时抛 ValueError。
+    """
     ledger = load_ledger()
     stock = _stock_in_order(ledger)
     if len(stock) < count:
-        print(f"库存不足：只剩 {len(stock)} 张，无法发放 {count} 张", file=sys.stderr)
-        return 1
+        raise ValueError(f"库存不足：只剩 {len(stock)} 张，无法发放 {count} 张")
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     chosen = stock[:count]
     for key in chosen:
         ledger[key] = {"status": "given", "note": note, "given_at": now}
     save_ledger(ledger)
+    return chosen
+
+
+def cmd_give(count: int, note: str) -> int:
+    try:
+        chosen = give_keys(count, note)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     print(f"已发放 {count} 张（备注：{note or '无'}）：")
     for key in chosen:
         print("  " + display_key(key))
     return 0
 
 
-def cmd_mark(keys: list[str], note: str) -> int:
+def mark_keys(keys: list[str], note: str) -> tuple[list[str], list[str]]:
+    """把指定卡密标记为已发放/已用，返回（已标记，跳过）两个列表。"""
     ledger = load_ledger()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    marked, skipped = [], []
     for key in keys:
         norm = key.replace("-", "").upper()
         if norm not in ledger:
-            print(f"跳过 {key}：不在台账中", file=sys.stderr)
+            skipped.append(key)
             continue
         ledger[norm] = {"status": "given", "note": note, "given_at": now}
-        print(f"已标记 {display_key(norm)}（{note}）")
+        marked.append(norm)
     save_ledger(ledger)
+    return marked, skipped
+
+
+def cmd_mark(keys: list[str], note: str) -> int:
+    marked, skipped = mark_keys(keys, note)
+    for key in skipped:
+        print(f"跳过 {key}：不在台账中", file=sys.stderr)
+    for key in marked:
+        print(f"已标记 {display_key(key)}（{note}）")
     return 0
 
 
-def cmd_status() -> int:
+def get_stats() -> dict:
+    """台账概览：总数、库存数、已发放数、最近发放记录。"""
     ledger = load_ledger()
     stock = [k for k, v in ledger.items() if v["status"] == "stock"]
     given = [(k, v) for k, v in ledger.items() if v["status"] == "given"]
-    print(f"台账共 {len(ledger)} 张：库存 {len(stock)} 张，已发放 {len(given)} 张")
-    if given:
+    return {
+        "total": len(ledger),
+        "stock": len(stock),
+        "given": len(given),
+        "recent": sorted(given, key=lambda kv: kv[1]["given_at"])[-5:],
+    }
+
+
+def cmd_status() -> int:
+    stats = get_stats()
+    print(f"台账共 {stats['total']} 张：库存 {stats['stock']} 张，"
+          f"已发放 {stats['given']} 张")
+    if stats["recent"]:
         print("最近发放：")
-        for key, v in sorted(given, key=lambda kv: kv[1]["given_at"])[-5:]:
+        for key, v in stats["recent"]:
             print(f"  {display_key(key)}  {v['given_at']}  {v['note']}")
     return 0
 

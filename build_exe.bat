@@ -1,23 +1,24 @@
 @echo off
-rem å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹ â€” PyInstaller æ‰“åŒ…è„šæœ¬ï¼ˆåŒå‡»è¿è¡Œï¼‰
+rem ÄÌÁúÍ¶¸åÖúÊÖ ¡ª PyInstaller ´ò°ü½Å±¾£¨Ë«»÷ÔËĞĞ£©
 cd /d "%~dp0"
 
-set PYI=.venv\Scripts\pyinstaller.exe
-if not exist %PYI% (
-    echo [é”™è¯¯] æœªæ‰¾åˆ° %PYI%ï¼Œè¯·å…ˆåˆ›å»º .venv å¹¶å®‰è£… pyinstaller
+rem ×¢Òâ£ºpyinstaller.exe °ü×°Æ÷ÔÚÖĞÎÄÂ·¾¶ÏÂ»á¾²Ä¬Ê§°Ü£¬Í³Ò»ÓÃ python -m PyInstaller
+set PY=.venv\Scripts\python.exe
+if not exist %PY% (
+    echo [´íÎó] Î´ÕÒµ½ %PY%£¬ÇëÏÈ´´½¨ .venv ²¢°²×° pyinstaller
     pause
     exit /b 1
 )
 
-rem ç»Ÿä¸€èµ° .specï¼ˆå·²å…³é—­ UPXï¼Œé¿å… Win10 ä¸Š QtWidgets DLL åŠ è½½å¤±è´¥ï¼‰
-%PYI% --noconfirm --clean "å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹.spec"
+rem Í³Ò»×ß .spec£¨ÒÑ¹Ø±Õ UPX£¬±ÜÃâ Win10 ÉÏ QtWidgets DLL ¼ÓÔØÊ§°Ü£©
+%PY% -m PyInstaller --noconfirm --clean "ÄÌÁúÍ¶¸åÖúÊÖ.spec"
 
 if errorlevel 1 (
-    echo [é”™è¯¯] æ‰“åŒ…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹è¾“å‡º
+    echo [´íÎó] ´ò°üÊ§°Ü£¬Çë¼ì²éÉÏ·½Êä³ö
     pause
     exit /b 1
 )
 
 echo.
-echo [å®Œæˆ] äº§ç‰©ï¼šdist\å¥¶é¾™æŠ•ç¨¿åŠ©æ‰‹.exe
+echo [Íê³É] ²úÎï£ºdist\ÄÌÁúÍ¶¸åÖúÊÖ.exe
 pause

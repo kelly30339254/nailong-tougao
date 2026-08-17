@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -24,6 +25,20 @@ ACTIVATE_URL = ("https://nailong-d4g922z6h6d9ff59e-1455870789"
 
 _LICENSE_FILE = "license.json"
 _KEY_RE = re.compile(r"^[A-Z0-9]{4,64}$")
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """HTTPS 校验用的 CA 证书上下文。
+
+    PyInstaller 打包的 macOS 应用不携带系统 CA 证书，默认上下文会因
+    「unable to get local issuer certificate」校验失败；用 certifi 的
+    cacert.pem 兜底（certifi 需打入包内，见 requirements.txt）。
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
 
 
 def machine_id() -> str:
@@ -96,7 +111,8 @@ def activate(card_key: str, url: str = ACTIVATE_URL,
             "Accept": "application/json",
         })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=_ssl_context()) as resp:
             raw = resp.read(64 * 1024 + 1)
     except urllib.error.HTTPError as exc:
         # 服务器返回 4xx/5xx：读取响应体里的业务错误信息，别伪装成"网络问题"
@@ -107,6 +123,10 @@ def activate(card_key: str, url: str = ACTIVATE_URL,
             pass
         extra = f"（{detail.strip()}）" if detail.strip() else ""
         return False, f"激活服务器返回错误（HTTP {exc.code}）{extra}"
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # URLError/OSError 涵盖连接失败、超时、TLS 证书校验失败（SSLError 是 OSError 子类）
+        reason = getattr(exc, "reason", exc)
+        return False, f"无法连接激活服务器，请检查网络后重试（{reason}）"
     except Exception:
         return False, "无法连接激活服务器，请检查网络后重试"
     if len(raw) > 64 * 1024:

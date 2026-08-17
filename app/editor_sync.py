@@ -9,7 +9,22 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.request
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """HTTPS 校验用的 CA 证书上下文。
+
+    PyInstaller 打包的 macOS 应用不携带系统 CA 证书，默认上下文会因
+    「unable to get local issuer certificate」校验失败；用 certifi 的
+    cacert.pem 兜底（certifi 需打入包内，见 requirements.txt）。
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
 
 # 硬编码的数据源（用户不可见、不可修改；隐藏云端地址）
 # 修改此常量即可切换数据源；重新打包 exe 后用户自动使用新地址。
@@ -42,7 +57,8 @@ def fetch_json(url: str, timeout: int = 30) -> dict:
             "Cache-Control": "no-cache",
         })
     max_bytes = 10 * 1024 * 1024
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=_ssl_context()) as resp:
         raw = resp.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError("云端数据文件超过 10 MB，已拒绝导入")
