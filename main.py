@@ -60,17 +60,50 @@ def main():
     from app.db import data_dir
     lock = QLockFile(os.path.join(data_dir(), "app.lock"))
     lock.setStaleLockTime(5000)
-    if not lock.tryLock(100):
-        # 数据目录从别的电脑整体拷来时，app.lock 里的主机名与本机不同，
-        # Qt 不会把这种锁视为过期锁，会永远误判「已在运行」，需手动清除后重试
-        _pid, hostname, _appname = lock.getLockInfo()
-        if hostname and hostname.lower() != socket.gethostname().lower():
-            lock.removeStaleLockFile()
-    if not lock.tryLock(100):
+
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+            return bool(h)
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _lock_is_bogus() -> bool:
+        """Qt 的过期锁判定很保守：主机名不同、锁文件损坏读不出信息时
+        都永远视为有效锁，需手动识别这些情况后清除。"""
+        pid, hostname, _appname = lock.getLockInfo()
+        if not hostname:
+            return True  # 锁文件损坏/0 字节（如拷贝中断、网盘同步占位）
+        if hostname.lower() != socket.gethostname().lower():
+            return True  # 从别的电脑整体拷来的数据目录
+        return not _pid_alive(pid)  # 本机进程已不存在（崩溃残留）
+
+    if not lock.tryLock(100) and _lock_is_bogus():
+        lock.removeStaleLockFile()
+        lock.tryLock(100)
+    if not lock.isLocked():
         app = QApplication(sys.argv)
         from PySide6.QtWidgets import QMessageBox
-        QMessageBox.warning(None, "奶龙投稿助手", "程序已在运行，请勿重复打开。")
-        sys.exit(1)
+        box = QMessageBox(QMessageBox.Warning, "奶龙投稿助手",
+                          "程序已在运行，请勿重复打开。\n\n"
+                          "如果刚从别的电脑迁移数据、或上次异常退出，"
+                          "这可能是残留锁文件误报。")
+        force = box.addButton("强制启动", QMessageBox.AcceptRole)
+        box.addButton("退出", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not force:
+            sys.exit(1)
+        # 用户确认没有别的实例在跑：删掉锁文件强行接管
+        lock.removeStaleLockFile()
+        lock.tryLock(100)
 
     app = QApplication(sys.argv)
     app.setApplicationName("奶龙投稿助手")
