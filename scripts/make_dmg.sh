@@ -6,6 +6,9 @@ cd "$(dirname "$0")/.."
 
 VER=$(python3 -c "from app import APP_VERSION; print(APP_VERSION)")
 APP="dist/奶龙投稿助手.app"
+if [ ! -d "$APP" ] && [ -d "dist/奶龙投稿助手/奶龙投稿助手.app" ]; then
+  APP="dist/奶龙投稿助手/奶龙投稿助手.app"
+fi
 [ -d "$APP" ] || { echo "[错误] 未找到 $APP，请先运行 PyInstaller 打包"; exit 1; }
 
 rm -rf build/dmg
@@ -18,7 +21,10 @@ hdiutil create -volname "奶龙投稿助手" -srcfolder build/dmg -ov -format UD
 echo "[完成] 产物：$OUT"
 
 # 便携包：.app 直接压缩成 zip，解压即可用（-y 保留符号链接）
+ROOT="$(pwd)"
 ZIP_OUT="奶龙投稿助手-${VER}-macos.zip"
 rm -f "$ZIP_OUT"
-(cd dist && zip -r -y "../$ZIP_OUT" "奶龙投稿助手.app")
+APP_DIR=$(dirname "$APP")
+APP_NAME=$(basename "$APP")
+(cd "$APP_DIR" && zip -r -y "$ROOT/$ZIP_OUT" "$APP_NAME")
 echo "[完成] 产物：$ZIP_OUT"
