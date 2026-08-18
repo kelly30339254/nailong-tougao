@@ -14,6 +14,7 @@ from app.settings_store import SettingsStore
 from app.theme import apply_theme, THEMES, DEFAULT_THEME
 from app.main_window import MainWindow, NAV_ITEMS
 from app.icons import APP_USER_MODEL_ID, app_icon, apply_windows_app_id, refresh_shell_icons
+from app.widgets import WheelBlocker
 from app.logging_setup import setup_logging, install_excepthook, get_logger
 
 
@@ -24,10 +25,10 @@ def _make_window():
     recovered = db.recover_stuck_sending()
     if recovered:
         print(f"已回收 {recovered} 条中断的发送中记录")
-    from app.theme import resource_path
-    seed_path = resource_path(os.path.join("app", "data", "builtin_editors.json"))
-    # 仅首次（无 builtin_seeded 标记）播种内置编辑；
-    # 用户清空编辑列表后重启不会重新灌入
+    from app.builtin_pack import default_pack_path
+    seed_path = default_pack_path()
+    # 按内置包版本增量播种：新装全量导入，升级只补缺失项。
+    # 内置数据以密文落库；用户清空列表后不会自动回灌。
     inserted, _skipped = db.seed_builtin_editors(seed_path)
     if inserted:
         print(f"已导入内置编辑 {inserted} 位")
@@ -73,6 +74,9 @@ def main():
     app.setDesktopFileName(APP_USER_MODEL_ID)
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
+    # 全局禁用下拉框/数值框的鼠标滚轮（避免误切换/误增减），滚轮只滚动页面
+    app._wheel_blocker = WheelBlocker(app)
+    app.installEventFilter(app._wheel_blocker)
 
     lock = QLockFile(os.path.join(data_dir(), "app.lock"))
     lock.setStaleLockTime(5000)

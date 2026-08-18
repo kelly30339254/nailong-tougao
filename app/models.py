@@ -24,6 +24,7 @@ class Editor:
     favorite: bool = False
     blacklisted: bool = False
     email_invalid: bool = False
+    origin: str = "user"      # builtin=内置（不可导出） / user=用户自建
     created_at: str = ""
 
 

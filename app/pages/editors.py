@@ -6,8 +6,8 @@ import io
 import os
 import re
 
-from PySide6.QtCore import Qt, QUrl, QTimer
-from PySide6.QtGui import QDesktopServices, QColor, QFontMetrics
+from PySide6.QtCore import Qt, QUrl, QTimer, QEvent
+from PySide6.QtGui import QDesktopServices, QColor, QFontMetrics, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QFrame,
@@ -174,6 +174,7 @@ class EditorsPage(QWidget):
         import_btn.clicked.connect(self._on_import)
         action_row.addWidget(import_btn)
         export_btn = QPushButton("导出CSV")
+        export_btn.setToolTip("只导出你自己添加的编辑；内置编辑不可导出")
         export_btn.clicked.connect(self._on_export)
         action_row.addWidget(export_btn)
         self.batch_bl_btn = QPushButton("批量加入小黑屋")
@@ -212,6 +213,7 @@ class EditorsPage(QWidget):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.itemSelectionChanged.connect(self._update_batch_btns)
+        self.table.installEventFilter(self)
         header = self.table.horizontalHeader()
         # 普通文本列的宽度在填充数据后一次性测量并固定；窗口不够时由
         # 横向滚动条承载，避免 Qt 的 ResizeToContents 在数千行数据上反复扫描。
@@ -276,9 +278,11 @@ class EditorsPage(QWidget):
         return editors
 
     def refresh(self):
-        total = self.db.counts()["编辑总数"]
+        builtin_n, user_n = self.db.editor_counts_by_origin()
+        extra = f"另有 {user_n} 位自建编辑，" if user_n else ""
         self.info_text.setText(
-            f"内置 {total} 位编辑（含各平台收稿邮箱/收稿方向），数据来自公开征稿信息，"
+            f"内置 {builtin_n} 位编辑（含各平台收稿邮箱/收稿方向），{extra}"
+            "数据来自公开征稿信息，仅供软件内使用、不可导出。"
             "投稿前请自行核实邮箱有效性。可点击右上角「同步最新编辑」获取云端最新数据。")
         # 重建筛选下拉（保留当前选择）
         platform = self.platform_combo.currentText()
@@ -552,10 +556,17 @@ class EditorsPage(QWidget):
 
     def _on_add(self):
         dlg = EditorDialog(self)
-        if dlg.exec() == QDialog.Accepted:
-            self.db.insert_editor(dlg.editor)
-            self.main_window.data_changed.emit()
-            self.refresh()
+        if dlg.exec() != QDialog.Accepted:
+            return
+        email = (dlg.editor.email or "").strip().lower()
+        existed = next((e for e in self.db.list_editors(include_blacklisted=True)
+                        if (e.email or "").strip().lower() == email), None)
+        if existed:
+            QMessageBox.information(self, "提示", "该邮箱已在编辑列表中，未重复添加。")
+            return
+        self.db.insert_editor(dlg.editor)
+        self.main_window.data_changed.emit()
+        self.refresh()
 
     def _on_edit(self, editor: Editor):
         fresh = self.db.get_editor(editor.id)
@@ -613,12 +624,39 @@ class EditorsPage(QWidget):
         if dlg.is_cancelled() and worker.isRunning():
             worker.stop()
 
-    def _on_export(self):
-        editors = self._current_editors()
-        if not editors:
-            QMessageBox.information(self, "提示", "当前筛选结果为空，无可导出数据")
+    def eventFilter(self, obj, event):
+        if obj is self.table and event.type() == QEvent.KeyPress:
+            if event.matches(QKeySequence.Copy):
+                self._copy_user_editors_only()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _copy_user_editors_only(self):
+        """剪贴板只允许带出自建编辑，内置行一律不复制。"""
+        from PySide6.QtWidgets import QApplication
+        rows = []
+        for e in self._selected_editors():
+            if getattr(e, "origin", "user") != "user":
+                continue
+            rows.append("\t".join([
+                e.name or "", e.platform or "", e.email or "", e.genres or "",
+                e.directions or "", e.status or "", e.fee_info or "",
+                e.source_url or "", e.notes or "",
+            ]))
+        if not rows:
+            QApplication.clipboard().clear()
             return
-        path, _ = QFileDialog.getSaveFileName(self, "导出编辑 CSV", "editors.csv",
+        QApplication.clipboard().setText("\n".join(rows))
+
+    def _on_export(self):
+        editors = [e for e in self._current_editors()
+                   if getattr(e, "origin", "user") == "user"]
+        if not editors:
+            QMessageBox.information(
+                self, "提示",
+                "没有可导出的自建编辑。\n内置编辑资料仅供软件内投稿使用，不能导出。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出自建编辑 CSV", "my_editors.csv",
                                               "CSV 文件 (*.csv)")
         if not path:
             return
@@ -629,7 +667,10 @@ class EditorsPage(QWidget):
                 writer.writerow([e.name, e.platform, e.email, e.genres,
                                  e.directions, e.status, e.fee_info,
                                  e.source_url, e.notes])
-        QMessageBox.information(self, "导出完成", f"已导出 {len(editors)} 条到：\n{path}")
+        skipped = len(self._current_editors()) - len(editors)
+        extra = f"\n已跳过 {skipped} 条内置编辑。" if skipped else ""
+        QMessageBox.information(self, "导出完成",
+                                f"已导出 {len(editors)} 条自建编辑到：\n{path}{extra}")
 
     # ---------- 云端同步 ----------
     def _on_sync(self):

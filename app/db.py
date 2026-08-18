@@ -129,6 +129,16 @@ class Database:
         if "status" not in editors_cols:
             self._conn.execute(
                 "ALTER TABLE editors ADD COLUMN status TEXT DEFAULT ''")
+        if "origin" not in editors_cols:
+            self._conn.execute(
+                "ALTER TABLE editors ADD COLUMN origin TEXT DEFAULT 'user'")
+        if "email_key" not in editors_cols:
+            self._conn.execute(
+                "ALTER TABLE editors ADD COLUMN email_key TEXT DEFAULT ''")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_editors_email_key ON editors(email_key)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_editors_origin ON editors(origin)")
         subs_cols = {r["name"] for r in
                      self._conn.execute("PRAGMA table_info(submissions)").fetchall()}
         if "scheduled_at" not in subs_cols:
@@ -211,93 +221,231 @@ class Database:
             self._conn.close()
 
     # ---------- 内置编辑播种 ----------
-    def seed_builtin_editors(self, json_path: str) -> tuple[int, int]:
-        """导入内置编辑数据，返回 (inserted, skipped)。
+    def seed_builtin_editors(self, pack_path: str) -> tuple[int, int]:
+        """导入加密内置编辑包，返回 (inserted, skipped)。
 
-        - 已有 builtin_seeded 标记时返回 (0, 0)（先 clear_seed_marker 才会再播）
-        - 按 email 去重：editors 表已有该 email 则跳过
+        - 已有相同版本的 builtin_pack_version 时返回 (0, 0)，但仍会加密/回填已有内置行
+        - 按 email_key 去重：已有该编辑则跳过
+        - 内置字段以密文落库，明文只在进程内解密
         """
+        from .builtin_pack import (
+            compute_pack_version, email_key, load_builtin_editors, protect_text,
+        )
+        self._purge_plaintext_editor_dumps()
+        if not pack_path or not os.path.exists(pack_path):
+            return (0, 0)
+        try:
+            items = load_builtin_editors(pack_path)
+        except (OSError, ValueError):
+            return (0, 0)
+        pack_keys: dict[str, dict] = {}
+        for d in items:
+            email = (d.get("email") or "").strip()
+            if email:
+                pack_keys[email_key(email)] = d
+        if not pack_keys:
+            return (0, 0)
+        version = compute_pack_version(items)
         with self._lock:
-            r = self._conn.execute(
+            seeded = self._conn.execute(
                 "SELECT value FROM settings WHERE key='builtin_seeded'").fetchone()
-            if r:
-                return (0, 0)
-            if not os.path.exists(json_path):
-                return (0, 0)
-            with open(json_path, encoding="utf-8") as f:
-                items = json.load(f)
-            seen = {row["email"].lower() for row in self._conn.execute(
-                "SELECT email FROM editors WHERE email != ''").fetchall()}
+            current = self._conn.execute(
+                "SELECT value FROM settings WHERE key='builtin_pack_version'"
+            ).fetchone()
+            already = bool(seeded) and (current["value"] if current else "") == version
+            existing = self._editor_key_map()
             rows = []
             skipped = 0
             for d in items:
                 email = (d.get("email") or "").strip()
                 if not email:
                     continue
-                if email.lower() in seen:
+                key = email_key(email)
+                if key in existing:
                     skipped += 1
                     continue
-                seen.add(email.lower())
-                rows.append(
-                    (d.get("name", ""), d.get("platform", ""), email,
-                     d.get("genres", ""), d.get("directions", ""), d.get("status", ""),
-                     d.get("fee_info", ""), d.get("source_url", ""),
-                     d.get("notes", ""), int(d.get("favorite", 0)),
-                     int(d.get("blacklisted", 0)), d.get("created_at", "")))
+                existing[key] = -1
+                rows.append((
+                    protect_text(d.get("name", "") or email),
+                    protect_text((d.get("platform") or "").strip() or "未知平台"),
+                    protect_text(email),
+                    protect_text(d.get("genres", "") or ""),
+                    protect_text(d.get("directions", "") or ""),
+                    protect_text(d.get("status", "") or ""),
+                    protect_text(d.get("fee_info", "") or ""),
+                    protect_text(""),
+                    protect_text((d.get("notes") or "")[:500]),
+                    0,
+                    int(bool(d.get("blacklisted", 0))),
+                    d.get("created_at", "") or _now(),
+                    key,
+                    "builtin",
+                ))
             with self._conn:
-                self._conn.executemany(
-                    "INSERT INTO editors(name,platform,email,genres,directions,status,"
-                    "fee_info,source_url,notes,favorite,blacklisted,created_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    rows)
+                if rows:
+                    self._conn.executemany(
+                        "INSERT INTO editors(name,platform,email,genres,directions,status,"
+                        "fee_info,source_url,notes,favorite,blacklisted,created_at,"
+                        "email_key,origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        rows)
+                self._protect_and_hydrate_builtin(pack_keys)
                 self._conn.execute(
                     "INSERT INTO settings(key, value) VALUES('builtin_seeded', '1')"
                     " ON CONFLICT(key) DO UPDATE SET value='1'")
+                self._conn.execute(
+                    "INSERT INTO settings(key, value) VALUES('builtin_pack_version', ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (version,))
+            if already:
+                return (0, 0)
             return (len(rows), skipped)
 
     def clear_seed_marker(self):
         """清除播种标记，使 seed_builtin_editors 可以再次执行。"""
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM settings WHERE key='builtin_seeded'")
+            self._conn.execute("DELETE FROM settings WHERE key='builtin_pack_version'")
+
+    def _editor_key_map(self) -> dict[str, int]:
+        from .builtin_pack import email_key, reveal_text
+        mapping: dict[str, int] = {}
+        rows = self._conn.execute(
+            "SELECT id, email, email_key FROM editors").fetchall()
+        for r in rows:
+            key = (r["email_key"] or "").strip()
+            if key:
+                mapping[key] = r["id"]
+                continue
+            email = reveal_text(r["email"] or "").strip()
+            if email:
+                mapping[email_key(email)] = r["id"]
+        return mapping
+
+    def _protect_and_hydrate_builtin(self, pack_keys: dict[str, dict]):
+        """把属于内置包的行标成 builtin，明文则加密；备份回填空字段。"""
+        from .builtin_pack import email_key, is_protected, protect_text, reveal_text
+        fields = ("name", "platform", "email", "genres", "directions",
+                  "status", "fee_info", "source_url", "notes")
+        rows = self._conn.execute("SELECT * FROM editors").fetchall()
+        for r in rows:
+            key = (r["email_key"] or "").strip()
+            email_plain = reveal_text(r["email"] or "").strip()
+            if not key and email_plain:
+                key = email_key(email_plain)
+            if not key or key not in pack_keys:
+                continue
+            src = pack_keys[key]
+            current_email = r["email"] or ""
+            if not current_email.strip():
+                values = (
+                    protect_text(src.get("name", "") or src.get("email", "")),
+                    protect_text((src.get("platform") or "").strip() or "未知平台"),
+                    protect_text(src.get("email", "")),
+                    protect_text(src.get("genres", "") or ""),
+                    protect_text(src.get("directions", "") or ""),
+                    protect_text(src.get("status", "") or ""),
+                    protect_text(src.get("fee_info", "") or ""),
+                    protect_text(""),
+                    protect_text((src.get("notes") or "")[:500]),
+                )
+            elif not is_protected(current_email):
+                values = tuple(protect_text(r[f] or "") for f in fields)
+            else:
+                self._conn.execute(
+                    "UPDATE editors SET origin='builtin', email_key=? WHERE id=?",
+                    (key, r["id"]))
+                continue
+            self._conn.execute(
+                "UPDATE editors SET name=?,platform=?,email=?,genres=?,directions=?,"
+                "status=?,fee_info=?,source_url=?,notes=?,origin='builtin',email_key=?"
+                " WHERE id=?",
+                (*values, key, r["id"]))
+
+    def _purge_plaintext_editor_dumps(self):
+        """清掉数据目录里可能残留的明文编辑名单。"""
+        leftovers = (
+            os.path.join(self._dir, "builtin_editors.json"),
+            os.path.join(self._dir, "editors-latest.json"),
+            os.path.join(self._dir, "editors.json"),
+        )
+        for path in leftovers:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
 
     # ---------- editors ----------
     def list_editors(self, keyword: str | None = None, platform: str | None = None,
                      genre: str | None = None, direction: str | None = None,
                      favorites_only: bool = False,
-                     include_blacklisted: bool = False) -> list[Editor]:
+                     include_blacklisted: bool = False,
+                     origin: str | None = None) -> list[Editor]:
         sql = "SELECT * FROM editors WHERE 1=1"
         args: list = []
-        if keyword:
-            sql += " AND (name LIKE ? OR email LIKE ? OR genres LIKE ? OR directions LIKE ?)"
-            like = f"%{keyword}%"
-            args += [like, like, like, like]
-        if platform:
-            sql += " AND platform = ?"
-            args.append(platform)
-        if genre:
-            sql += " AND genres LIKE ?"
-            args.append(f"%{genre}%")
-        if direction:
-            sql += " AND directions LIKE ?"
-            args.append(f"%{direction}%")
         if favorites_only:
             sql += " AND favorite = 1"
         if not include_blacklisted:
             sql += " AND blacklisted = 0"
+        if origin:
+            sql += " AND origin = ?"
+            args.append(origin)
         sql += " ORDER BY favorite DESC, id DESC"
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
-        return [self._row_to_editor(r) for r in rows]
+        editors = [self._row_to_editor(r) for r in rows]
+        if keyword:
+            kw = keyword.lower()
+            editors = [e for e in editors
+                       if kw in (e.name or "").lower()
+                       or kw in (e.email or "").lower()
+                       or kw in (e.genres or "").lower()
+                       or kw in (e.directions or "").lower()
+                       or kw in (e.platform or "").lower()]
+        if platform:
+            editors = [e for e in editors if e.platform == platform]
+        if genre:
+            editors = [e for e in editors if genre in (e.genres or "")]
+        if direction:
+            editors = [e for e in editors if direction in (e.directions or "")]
+        return editors
 
-    @staticmethod
-    def _row_to_editor(r: sqlite3.Row) -> Editor:
-        return Editor(id=r["id"], name=r["name"], platform=r["platform"],
-                      email=r["email"], genres=r["genres"], fee_info=r["fee_info"],
-                      source_url=r["source_url"], notes=r["notes"],
-                      directions=r["directions"] if "directions" in r.keys() else "",
-                      status=r["status"] if "status" in r.keys() else "",
+    def list_user_editors(self, **kwargs) -> list[Editor]:
+        """仅用户自建编辑（可导出）。"""
+        kwargs["origin"] = "user"
+        kwargs.setdefault("include_blacklisted", True)
+        return self.list_editors(**kwargs)
+
+    def editor_counts_by_origin(self) -> tuple[int, int]:
+        """返回 (内置数, 自建数)。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT origin, COUNT(*) AS c FROM editors GROUP BY origin").fetchall()
+        builtin = user = 0
+        for r in rows:
+            if (r["origin"] or "user") == "builtin":
+                builtin += r["c"]
+            else:
+                user += r["c"]
+        return builtin, user
+
+    def _row_to_editor(self, r: sqlite3.Row) -> Editor:
+        from .builtin_pack import reveal_text
+        return Editor(id=r["id"], name=reveal_text(r["name"] or ""),
+                      platform=reveal_text(r["platform"] or ""),
+                      email=reveal_text(r["email"] or ""),
+                      genres=reveal_text(r["genres"] or ""),
+                      fee_info=reveal_text(r["fee_info"] or ""),
+                      source_url=reveal_text(r["source_url"] or ""),
+                      notes=reveal_text(r["notes"] or ""),
+                      directions=reveal_text(r["directions"] or "")
+                      if "directions" in r.keys() else "",
+                      status=reveal_text(r["status"] or "")
+                      if "status" in r.keys() else "",
                       favorite=bool(r["favorite"]), blacklisted=bool(r["blacklisted"]),
                       email_invalid=bool(r["email_invalid"]),
+                      origin=(r["origin"] if "origin" in r.keys() and r["origin"]
+                              else "user"),
                       created_at=r["created_at"])
 
     def get_editor(self, editor_id: int) -> Editor | None:
@@ -306,23 +454,51 @@ class Database:
         return self._row_to_editor(r) if r else None
 
     def insert_editor(self, e: Editor) -> int:
+        from .builtin_pack import email_key
+        key = email_key(e.email)
         with self._lock, self._conn:
+            existed = self._conn.execute(
+                "SELECT id FROM editors WHERE email_key=?", (key,)).fetchone()
+            if existed:
+                return existed["id"]
+            mapped = self._editor_key_map()
+            if key in mapped:
+                return mapped[key]
             cur = self._conn.execute(
-                "INSERT INTO editors(name,platform,email,genres,directions,status,fee_info,source_url,notes,favorite,blacklisted,created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO editors(name,platform,email,genres,directions,status,fee_info,"
+                "source_url,notes,favorite,blacklisted,created_at,email_key,origin)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (e.name, e.platform, e.email, e.genres, e.directions, e.status,
                  e.fee_info, e.source_url, e.notes, int(e.favorite),
-                 int(e.blacklisted), e.created_at or _now()))
+                 int(e.blacklisted), e.created_at or _now(),
+                 key, "user"))
             return cur.lastrowid
 
     def update_editor(self, e: Editor):
+        from .builtin_pack import email_key, protect_text
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT origin FROM editors WHERE id=?", (e.id,)).fetchone()
+            origin = (row["origin"] if row and row["origin"] else "user")
+            name, platform, email = e.name, e.platform, e.email
+            genres, directions, status = e.genres, e.directions, e.status
+            fee_info, source_url, notes = e.fee_info, e.source_url, e.notes
+            if origin == "builtin":
+                name = protect_text(name)
+                platform = protect_text(platform)
+                email = protect_text(email)
+                genres = protect_text(genres)
+                directions = protect_text(directions)
+                status = protect_text(status)
+                fee_info = protect_text(fee_info)
+                source_url = protect_text(source_url)
+                notes = protect_text(notes)
             self._conn.execute(
                 "UPDATE editors SET name=?,platform=?,email=?,genres=?,directions=?,status=?,"
-                "fee_info=?,source_url=?,notes=?,favorite=?,blacklisted=? WHERE id=?",
-                (e.name, e.platform, e.email, e.genres, e.directions, e.status,
-                 e.fee_info, e.source_url, e.notes, int(e.favorite),
-                 int(e.blacklisted), e.id))
+                "fee_info=?,source_url=?,notes=?,favorite=?,blacklisted=?,email_key=? WHERE id=?",
+                (name, platform, email, genres, directions, status,
+                 fee_info, source_url, notes, int(e.favorite),
+                 int(e.blacklisted), email_key(e.email), e.id))
 
     def delete_editor(self, editor_id: int):
         with self._lock, self._conn:
@@ -360,22 +536,32 @@ class Database:
             r = self._conn.execute("SELECT blacklisted FROM editors WHERE id=?", (editor_id,)).fetchone()
             return bool(r["blacklisted"]) if r else False
 
+    @staticmethod
+    def _split_tags(text: str) -> list[str]:
+        result: list[str] = []
+        seen = set()
+        for part in (text or "").replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
+            part = part.strip()
+            if part and part not in seen:
+                seen.add(part)
+                result.append(part)
+        return result
+
     def distinct_platforms(self) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT platform FROM editors WHERE platform != '' ORDER BY platform").fetchall()
-        return [r["platform"] for r in rows]
+            rows = self._conn.execute("SELECT platform FROM editors").fetchall()
+        values = {self._plain_field(r["platform"]) for r in rows}
+        return sorted(v for v in values if v)
 
     def distinct_genres(self) -> list[str]:
         """genres 以 / 、，,空格 分隔存储，拆分后去重。"""
         with self._lock:
-            rows = self._conn.execute("SELECT DISTINCT genres FROM editors WHERE genres != ''").fetchall()
+            rows = self._conn.execute("SELECT genres FROM editors").fetchall()
         result: list[str] = []
         seen = set()
         for r in rows:
-            for part in r["genres"].replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
-                part = part.strip()
-                if part and part not in seen:
+            for part in self._split_tags(self._plain_field(r["genres"])):
+                if part not in seen:
                     seen.add(part)
                     result.append(part)
         return sorted(result)
@@ -383,22 +569,26 @@ class Database:
     def distinct_directions(self) -> list[str]:
         """收稿方向（directions）拆分去重，与 genres 相同的分隔约定。"""
         with self._lock:
-            rows = self._conn.execute("SELECT DISTINCT directions FROM editors WHERE directions != ''").fetchall()
+            rows = self._conn.execute("SELECT directions FROM editors").fetchall()
         result: list[str] = []
         seen = set()
         for r in rows:
-            for part in r["directions"].replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
-                part = part.strip()
-                if part and part not in seen:
+            for part in self._split_tags(self._plain_field(r["directions"])):
+                if part not in seen:
                     seen.add(part)
                     result.append(part)
         return sorted(result)
 
     def distinct_statuses(self) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT status FROM editors WHERE status != '' ORDER BY status").fetchall()
-        return [r["status"] for r in rows]
+            rows = self._conn.execute("SELECT status FROM editors").fetchall()
+        values = {self._plain_field(r["status"]) for r in rows}
+        return sorted(v for v in values if v)
+
+    @staticmethod
+    def _plain_field(value: str) -> str:
+        from .builtin_pack import reveal_text
+        return reveal_text(value or "").strip()
 
     # ---------- manuscripts ----------
     @staticmethod
@@ -615,7 +805,13 @@ class Database:
     # ---------- 邮箱失效标记（退信） ----------
     def mark_email_invalid(self, email: str) -> int:
         """按邮箱地址置 email_invalid=1，返回影响行数。"""
+        from .builtin_pack import email_key
+        key = email_key(email)
         with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE editors SET email_invalid=1 WHERE email_key=?", (key,))
+            if cur.rowcount:
+                return cur.rowcount
             cur = self._conn.execute(
                 "UPDATE editors SET email_invalid=1 WHERE lower(email)=lower(?)",
                 (email.strip(),))
@@ -635,37 +831,42 @@ class Database:
           不存在则新增。已收藏/小黑屋/退信标记保留。
         返回 {"inserted": n, "updated": m, "total": 本地总数}
         """
+        from .builtin_pack import email_key, protect_text
         inserted = updated = 0
         with self._lock, self._conn:
-            existing = {r["email"].lower(): r["id"]
-                        for r in self._conn.execute(
-                            "SELECT id, email FROM editors WHERE email != ''").fetchall()}
+            existing = self._editor_key_map()
             for d in items:
                 email = (d.get("email") or "").strip()
                 if not email:
                     continue
-                key = email.lower()
+                key = email_key(email)
+                name = protect_text(d.get("name", "") or email)
+                platform = protect_text(d.get("platform", "") or "")
+                enc_email = protect_text(email)
+                genres = protect_text(d.get("genres", "") or "")
+                directions = protect_text(d.get("directions", "") or "")
+                status = protect_text(d.get("status", "") or "")
+                fee_info = protect_text(d.get("fee_info", "") or "")
+                notes = protect_text(d.get("notes", "") or "")
+                source_url = protect_text(d.get("source_url", "") or "")
                 if key in existing:
                     eid = existing[key]
                     self._conn.execute(
-                        "UPDATE editors SET name=?,platform=?,genres=?,directions=?,"
-                        "status=?,fee_info=?,notes=?,source_url=? WHERE id=?",
-                        (d.get("name", ""), d.get("platform", ""),
-                         d.get("genres", ""), d.get("directions", ""),
-                         d.get("status", ""), d.get("fee_info", ""),
-                         d.get("notes", ""), d.get("source_url", ""), eid))
+                        "UPDATE editors SET name=?,platform=?,email=?,genres=?,directions=?,"
+                        "status=?,fee_info=?,notes=?,source_url=?,origin='builtin',"
+                        "email_key=? WHERE id=?",
+                        (name, platform, enc_email, genres, directions, status,
+                         fee_info, notes, source_url, key, eid))
                     updated += 1
                 else:
                     self._conn.execute(
                         "INSERT INTO editors(name,platform,email,genres,directions,status,"
-                        "fee_info,source_url,notes,blacklisted,created_at)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (d.get("name", ""), d.get("platform", ""), email,
-                         d.get("genres", ""), d.get("directions", ""),
-                         d.get("status", ""), d.get("fee_info", ""),
-                         d.get("source_url", ""), d.get("notes", ""),
-                         int(d.get("status") == "停止收稿"), _now()))
-                    existing[key] = -1  # 防止重复 key 重复插入
+                        "fee_info,source_url,notes,blacklisted,created_at,email_key,origin)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (name, platform, enc_email, genres, directions, status,
+                         fee_info, source_url, notes,
+                         int(d.get("status") == "停止收稿"), _now(), key, "builtin"))
+                    existing[key] = -1
                     inserted += 1
         return {"inserted": inserted, "updated": updated,
                 "total": self.counts()["编辑总数"]}
@@ -697,15 +898,20 @@ class Database:
         """各平台投递表现：平台/投递/回复/过稿，按投递数倒序。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT COALESCE(NULLIF(e.platform, ''), '未知平台') AS platform,"
-                " COUNT(*) AS total,"
-                " SUM(CASE WHEN s.reply_status != '无' THEN 1 ELSE 0 END) AS replied,"
-                " SUM(CASE WHEN s.reply_status = '过稿' THEN 1 ELSE 0 END) AS passed"
+                "SELECT e.platform AS platform, s.reply_status AS reply_status"
                 " FROM submissions s LEFT JOIN editors e ON e.id = s.editor_id"
-                " WHERE s.status = '已发'"
-                " GROUP BY platform ORDER BY total DESC").fetchall()
-        return [{"platform": r["platform"], "total": r["total"],
-                 "replied": r["replied"], "passed": r["passed"]} for r in rows]
+                " WHERE s.status = '已发'").fetchall()
+        acc: dict[str, dict] = {}
+        for r in rows:
+            platform = self._plain_field(r["platform"]) or "未知平台"
+            item = acc.setdefault(platform, {"platform": platform, "total": 0,
+                                             "replied": 0, "passed": 0})
+            item["total"] += 1
+            if (r["reply_status"] or "无") != "无":
+                item["replied"] += 1
+            if r["reply_status"] == "过稿":
+                item["passed"] += 1
+        return sorted(acc.values(), key=lambda x: x["total"], reverse=True)
 
     def avg_reply_days(self) -> float | None:
         """平均回复时长（天，sent_at → replied_at），无数据返回 None。"""
@@ -747,6 +953,13 @@ class Database:
                             dest.execute(
                                 "UPDATE settings SET value=? WHERE key=?",
                                 (json.dumps(data, ensure_ascii=False), key))
+                    try:
+                        dest.execute(
+                            "UPDATE editors SET name='',platform='',email='',genres='',"
+                            "directions='',status='',fee_info='',source_url='',notes='' "
+                            "WHERE origin='builtin'")
+                    except sqlite3.OperationalError:
+                        pass
                     dest.commit()
                 finally:
                     dest.close()
@@ -1116,9 +1329,10 @@ class Database:
                 " FROM sales s LEFT JOIN manuscripts m ON m.id = s.manuscript_id"
                 " ORDER BY s.id DESC LIMIT ?", (limit,)).fetchall()
         for s in subs:
+            ename = self._plain_field(s["ename"]) or "未知编辑"
             items.append({
                 "kind": "投稿",
-                "text": f"向 {s['ename'] or '未知编辑'} 投递《{s['mtitle'] or '未知文稿'}》（{s['status']}）",
+                "text": f"向 {ename} 投递《{s['mtitle'] or '未知文稿'}》（{s['status']}）",
                 "time": s["sent_at"] or "",
             })
         for r in reps:
@@ -1174,11 +1388,17 @@ class Database:
             args.append(reply_filter)
         if keyword:
             like = f"%{keyword}%"
-            where.append(
-                "(IFNULL(m.title,'') LIKE ? OR IFNULL(e.name,'') LIKE ?"
-                " OR IFNULL(e.email,'') LIKE ? OR IFNULL(s.to_email,'') LIKE ?"
-                " OR IFNULL(s.from_mailbox,'') LIKE ?)")
-            args.extend([like, like, like, like, like])
+            matched_ids = [e.id for e in self.list_editors(
+                keyword=keyword, include_blacklisted=True) if e.id]
+            clause = ("(IFNULL(m.title,'') LIKE ? OR IFNULL(s.to_email,'') LIKE ?"
+                      " OR IFNULL(s.from_mailbox,'') LIKE ?")
+            args.extend([like, like, like])
+            if matched_ids:
+                marks = ",".join("?" for _ in matched_ids)
+                clause += f" OR s.editor_id IN ({marks})"
+                args.extend(matched_ids)
+            clause += ")"
+            where.append(clause)
         where_sql = " AND ".join(where)
         from_sql = (
             "FROM submissions s"
@@ -1188,13 +1408,29 @@ class Database:
         order_sql = self._order_clause(order_by, order_map, "s.id", desc)
         limit = max(1, int(limit or 50))
         offset = max(0, int(offset or 0))
+        sort_in_python = order_by in ("editor", "platform")
         with self._lock:
             total = self._conn.execute(
                 f"SELECT COUNT(*) AS c {from_sql}", args).fetchone()["c"]
-            rows = self._conn.execute(
-                f"SELECT s.* {from_sql} ORDER BY {order_sql}, s.id DESC"
-                " LIMIT ? OFFSET ?",
-                args + [limit, offset]).fetchall()
+            if sort_in_python:
+                rows = self._conn.execute(
+                    f"SELECT s.* {from_sql}", args).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT s.* {from_sql} ORDER BY {order_sql}, s.id DESC"
+                    " LIMIT ? OFFSET ?",
+                    args + [limit, offset]).fetchall()
+        if sort_in_python:
+            editors_map = {e.id: e for e in self.list_editors(include_blacklisted=True)}
+
+            def _sort_key(row):
+                editor = editors_map.get(row["editor_id"])
+                if order_by == "editor":
+                    return ((editor.name if editor else "") or "").lower()
+                return ((editor.platform if editor else "") or "").lower()
+
+            rows = sorted(rows, key=_sort_key, reverse=desc)
+            rows = rows[offset:offset + limit]
         return total, [self._row_to_submission(r) for r in rows]
 
     def list_replies_page(self, *, unread_only: bool = False,
@@ -1286,30 +1522,28 @@ class Database:
 
     def upsert_editors_bulk(self, editors: list[Editor]) -> tuple[int, int]:
         """单事务按邮箱去重插入编辑。已存在或邮箱为空则跳过。返回 (导入, 跳过)。"""
+        from .builtin_pack import email_key
         imported = skipped = 0
         with self._lock, self._conn:
-            existing = {
-                (r["email"] or "").strip().lower()
-                for r in self._conn.execute(
-                    "SELECT email FROM editors WHERE email != ''").fetchall()
-            }
+            existing = set(self._editor_key_map())
             for e in editors:
                 email = (e.email or "").strip()
                 if not email:
                     skipped += 1
                     continue
-                key = email.lower()
+                key = email_key(email)
                 if key in existing:
                     skipped += 1
                     continue
                 self._conn.execute(
                     "INSERT INTO editors(name,platform,email,genres,directions,status,"
-                    "fee_info,source_url,notes,favorite,blacklisted,created_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "fee_info,source_url,notes,favorite,blacklisted,created_at,"
+                    "email_key,origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (e.name or email, e.platform or "", email, e.genres or "",
                      e.directions or "", e.status or "", e.fee_info or "",
                      e.source_url or "", e.notes or "", int(bool(e.favorite)),
-                     int(bool(e.blacklisted)), e.created_at or _now()))
+                     int(bool(e.blacklisted)), e.created_at or _now(),
+                     key, "user"))
                 existing.add(key)
                 imported += 1
         return imported, skipped

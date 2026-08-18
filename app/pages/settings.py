@@ -686,7 +686,7 @@ class SettingsPage(QWidget):
         import_btn.clicked.connect(self._on_backup_import)
         btn_row.addWidget(import_btn)
         reseed_btn = QPushButton("重新导入内置编辑")
-        reseed_btn.setToolTip("按邮箱去重导入内置编辑库，已有邮箱会跳过")
+        reseed_btn.setToolTip("按邮箱去重导入加密内置编辑库，已有邮箱会跳过；内置资料不可导出")
         reseed_btn.clicked.connect(self._on_reseed_editors)
         btn_row.addWidget(reseed_btn)
         btn_row.addStretch()
@@ -698,8 +698,10 @@ class SettingsPage(QWidget):
         log_btn.clicked.connect(self._on_export_log)
         btn_row.addWidget(log_btn)
         hint = QLabel(
-            "备份为 zip（含数据库和 files 附件），不含邮箱授权码。导入会覆盖当前数据，"
-            "恢复前会自动在 backups/ 再留一份兜底。启动超过 7 天会自动备份并轮换保留 5 份。")
+            "备份为 zip（含数据库和 files 附件），不含邮箱授权码，也不含内置编辑明细。"
+            "导入会覆盖当前数据，恢复前会自动在 backups/ 再留一份兜底；"
+            "内置编辑会在下次启动时从加密包重新载入。"
+            "启动超过 7 天会自动备份并轮换保留 5 份。")
         hint.setObjectName("hintText")
         hint.setWordWrap(True)
         vbox.addWidget(hint)
@@ -822,8 +824,8 @@ class SettingsPage(QWidget):
 
     def _on_reseed_editors(self):
         """重新导入内置编辑（按 email 去重，已有跳过）。"""
-        from ..theme import resource_path
-        path = resource_path(os.path.join("app", "data", "builtin_editors.json"))
+        from ..builtin_pack import default_pack_path
+        path = default_pack_path()
         self.db.clear_seed_marker()
         inserted, skipped = self.db.seed_builtin_editors(path)
         self.main_window.data_changed.emit()

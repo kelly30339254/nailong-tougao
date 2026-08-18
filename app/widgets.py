@@ -5,11 +5,12 @@ import csv
 import json
 import logging
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QObject, QEvent
 from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QWidget, QHBoxLayout, QLabel, QFrame,
     QDialog, QVBoxLayout, QProgressBar, QPushButton, QFileDialog, QMessageBox,
-    QAbstractItemView, QHeaderView, QComboBox, QLineEdit,
+    QAbstractItemView, QHeaderView, QComboBox, QLineEdit, QSpinBox,
+    QDoubleSpinBox, QAbstractScrollArea,
 )
 
 _log = logging.getLogger(__name__)
@@ -435,3 +436,34 @@ class PagedTable(QWidget):
             self.store.set(self.width_key, json.dumps(widths))
         except Exception:
             _log.debug("保存列宽失败", exc_info=True)
+
+
+class WheelBlocker(QObject):
+    """全局滚轮过滤器：拦截下拉框/数值框的鼠标滚轮，避免误操作。
+
+    悬停在 QComboBox / QSpinBox / QDoubleSpinBox 上滚动滚轮时，
+    不再切换选项或增减数值，而是把滚轮手势转发给最近的可滚动容器
+    （QScrollArea / 表格等）的垂直滚动条，实现「滚轮只控制页面上下滚动」。
+    其余控件类型保持原有滚轮行为。
+    """
+
+    _WHEEL_TYPES = (QComboBox, QSpinBox, QDoubleSpinBox)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and isinstance(obj, self._WHEEL_TYPES):
+            scroll = self._nearest_scrollable(obj)
+            if scroll is not None:
+                vbar = scroll.verticalScrollBar()
+                if vbar is not None and vbar.maximum() > vbar.minimum():
+                    vbar.event(event)
+            return True  # 消费原事件，阻止控件自行切换/增减
+        return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _nearest_scrollable(widget):
+        parent = widget.parent()
+        while parent is not None:
+            if isinstance(parent, QAbstractScrollArea):
+                return parent
+            parent = parent.parent()
+        return None
