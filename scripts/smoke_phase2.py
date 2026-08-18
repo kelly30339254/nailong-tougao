@@ -255,6 +255,8 @@ dashboard_page.refresh()
 
 # 近期动态
 check("近期动态有条目", dashboard_page.activity_box.count() >= 1)
+check("近期动态可滚动", hasattr(dashboard_page, "activity_scroll")
+      and dashboard_page.activity_scroll.widgetResizable())
 check("相对时间", _relative_time("2099-01-01 00:00:00")  # 未来时间也不崩
       and _relative_time("") == "")
 

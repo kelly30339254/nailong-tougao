@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QTableWidget, QAbstractItemView, QHeaderView,
+    QSizePolicy,
 )
 
 from ..workers import FetchWorker
@@ -36,6 +37,57 @@ def _relative_time(time_str: str) -> str:
     if minutes >= 1:
         return f"{minutes} 分钟前"
     return "刚刚"
+
+
+class _ActivityRow(QWidget):
+    """近期动态一行：圆点 + 可换行正文 + 时间。按分配宽度计算高度，避免半行被裁。"""
+
+    def __init__(self, text: str, time_text: str, color: str):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(8)
+        row.addWidget(make_dot(color, 8), 0, Qt.AlignTop)
+        self._label = QLabel(text)
+        self._label.setWordWrap(True)
+        self._label.setToolTip(text)
+        self._label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # Ignored 横向：按分配宽度换行，并正确上报高度
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._label.setMinimumWidth(80)
+        row.addWidget(self._label, 1)
+        time_label = QLabel(time_text)
+        time_label.setObjectName("hintText")
+        time_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        time_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        time_w = max(64, time_label.sizeHint().width() + 4)
+        time_label.setFixedWidth(time_w)
+        self._time_w = time_w
+        row.addWidget(time_label, 0, Qt.AlignTop)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def _wrapped_height(self, width: int) -> int:
+        text_w = max(80, width - 8 - 8 - 8 - self._time_w)
+        return max(self._label.fontMetrics().height() + 6,
+                   self._label.heightForWidth(text_w) + 6)
+
+    def heightForWidth(self, width: int) -> int:
+        return self._wrapped_height(width)
+
+    def sizeHint(self) -> QSize:
+        # 用卡片半宽估算，避免 Ignored 策略按 80px 算出十几行高的 sizeHint
+        width = self.width() if self.width() > 80 else 360
+        return QSize(width, self._wrapped_height(width))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        h = self._wrapped_height(max(self.width(), 1))
+        if self.minimumHeight() != h:
+            self.setMinimumHeight(h)
+            self.updateGeometry()
 
 
 class StatCard(QFrame):
@@ -119,15 +171,46 @@ class DashboardPage(QWidget):
 
         activity_card = QFrame()
         activity_card.setObjectName("card")
+        activity_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         activity_layout = QVBoxLayout(activity_card)
         activity_layout.setContentsMargins(16, 14, 16, 14)
+        activity_layout.setSpacing(8)
         activity_title = QLabel("近期动态")
         activity_title.setObjectName("cardTitle")
         activity_layout.addWidget(activity_title)
-        self.activity_box = QVBoxLayout()
-        self.activity_box.setSpacing(6)
-        activity_layout.addLayout(self.activity_box)
-        activity_layout.addStretch()
+
+        # 动态条目放进可滚动区：条目一多时不再被卡片圆角裁掉下半截
+        self.activity_scroll = QScrollArea()
+        self.activity_scroll.setObjectName("activityScroll")
+        self.activity_scroll.setWidgetResizable(True)
+        self.activity_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.activity_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.activity_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.activity_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.activity_scroll.setStyleSheet(
+            "QScrollArea#activityScroll { background: transparent; border: none; }"
+        )
+        self.activity_scroll.viewport().setStyleSheet("background: transparent;")
+        activity_inner = QWidget()
+        activity_inner.setObjectName("activityInner")
+        activity_inner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        activity_inner.setStyleSheet("QWidget#activityInner { background: transparent; }")
+        self.activity_box = QVBoxLayout(activity_inner)
+        self.activity_box.setContentsMargins(0, 0, 6, 0)
+        self.activity_box.setSpacing(8)
+        self.activity_box.setAlignment(Qt.AlignTop)
+        self.activity_scroll.setWidget(activity_inner)
+        activity_layout.addWidget(self.activity_scroll, 1)
+
+        more_btn = QPushButton("查看全部 →")
+        more_btn.setObjectName("iconBtn")
+        more_btn.setCursor(Qt.PointingHandCursor)
+        more_btn.clicked.connect(lambda: self.main_window.navigate("records"))
+        more_row = QHBoxLayout()
+        more_row.setContentsMargins(0, 0, 0, 0)
+        more_row.addStretch()
+        more_row.addWidget(more_btn)
+        activity_layout.addLayout(more_row)
         bottom.addWidget(activity_card, 1)
 
         layout.addLayout(bottom, 1)
@@ -251,33 +334,19 @@ class DashboardPage(QWidget):
             empty = QLabel("暂无记录")
             empty.setObjectName("hintText")
             self.activity_box.addWidget(empty)
+            inner = self.activity_scroll.widget()
+            if inner is not None:
+                inner.adjustSize()
             return
         for act in activities:
-            row = QHBoxLayout()
-            color = (theme_colors(self.store.get_theme())["primary"]
-                     if act["kind"] == "投稿" else "#2F9E44")
-            dot = make_dot(color, 8)
-            row.addWidget(dot, 0, Qt.AlignTop)
-            text = QLabel(act["text"])
-            text.setWordWrap(True)
-            row.addWidget(text, 1)
-            time_label = QLabel(_relative_time(act["time"]))
-            time_label.setObjectName("hintText")
-            row.addWidget(time_label, 0, Qt.AlignTop)
-            wrap = QWidget()
-            wrap.setLayout(row)
-            self.activity_box.addWidget(wrap)
-        # 超过一屏时提供"查看全部"入口（投递记录页含完整筛选）
-        more_btn = QPushButton("查看全部 →")
-        more_btn.setObjectName("iconBtn")
-        more_btn.setCursor(Qt.PointingHandCursor)
-        more_btn.clicked.connect(lambda: self.main_window.navigate("records"))
-        more_row = QHBoxLayout()
-        more_row.addStretch()
-        more_row.addWidget(more_btn)
-        more_wrap = QWidget()
-        more_wrap.setLayout(more_row)
-        self.activity_box.addWidget(more_wrap)
+            self.activity_box.addWidget(_ActivityRow(
+                act["text"], _relative_time(act["time"]),
+                theme_colors(self.store.get_theme())["primary"]
+                if act["kind"] == "投稿" else "#2F9E44",
+            ))
+        inner = self.activity_scroll.widget()
+        if inner is not None:
+            inner.adjustSize()
 
     # ---------- 数据统计 ----------
     def _refresh_stats(self):
