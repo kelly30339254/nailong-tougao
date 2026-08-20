@@ -1,6 +1,6 @@
 {
-  "version": "1.3.8",
-  "notes": "1.3.8新增500位正常收稿编辑；修复鼠标滚轮误操作问题。\n夸克网盘：https://pan.quark.cn/s/28ad762012de\n百度网盘：https://pan.baidu.com/s/1BQE9mhYLDtd9kc49qmzghw?pwd=spmv （提取码 spmv）",
+  "version": "1.4.0",
+  "notes": "1.4.0 更新：\n1. 支持最多 10 篇稿件组成投稿批次，每篇可独立选择编辑、发件邮箱和模板。\n2. 多邮箱并行发送，每个邮箱后续邮件随机间隔 1–3 分钟；本地每日上限默认关闭。\n3. 新增模板库与随机轮换，支持稿件类型、收稿方向多标签筛选。\n4. DOCX 字数优先使用 Word 最后保存的统计值，并显示字数来源。\n5. 工作台新增更新公告栏，并增强批次暂停、恢复与异常保护。\n\n夸克网盘：https://pan.quark.cn/s/28ad762012de\n百度网盘：https://pan.baidu.com/s/1BQE9mhYLDtd9kc49qmzghw?pwd=spmv （提取码 spmv）",
   "download_url": "https://pan.quark.cn/s/28ad762012de",
   "github_url": ""
 }
