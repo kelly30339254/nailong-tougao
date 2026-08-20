@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+python3 scripts/validate_release.py
 VER=$(python3 -c "from app import APP_VERSION; print(APP_VERSION)")
 BIN="dist/奶龙投稿助手"
 [ -f "$BIN" ] || { echo "[错误] 未找到 $BIN，请先运行 PyInstaller 打包"; exit 1; }

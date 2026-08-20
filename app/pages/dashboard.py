@@ -7,13 +7,14 @@ from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QTableWidget, QAbstractItemView, QHeaderView,
-    QSizePolicy,
+    QSizePolicy, QDialog, QTextBrowser, QTabWidget,
 )
 
 from ..workers import FetchWorker
 from ..reply_ingest import ingest_results
 from ..widgets import mk_item, make_dot
 from ..theme import theme_colors
+from ..announcements import load_announcements
 
 STAT_KEYS = ["编辑总数", "文稿", "待回复", "过稿", "退稿", "未读回信"]
 # 注意：卡片键与 db.counts() 仅"文稿"→"文稿数"一个差异，直接在 refresh 内映射，无冗余表
@@ -137,6 +138,24 @@ class DashboardPage(QWidget):
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(12)
 
+        self._announcements = load_announcements()
+        if self._announcements:
+            latest = self._announcements[0]
+            banner = QFrame()
+            banner.setObjectName("infoBar")
+            banner_row = QHBoxLayout(banner)
+            banner_row.setContentsMargins(12, 8, 12, 8)
+            banner_text = QLabel(
+                f"{latest['date']}  ·  {latest['title']}  —  {latest['summary']}")
+            banner_text.setObjectName("infoBarText")
+            banner_text.setWordWrap(True)
+            banner_row.addWidget(banner_text, 1)
+            detail_btn = QPushButton("查看更新")
+            detail_btn.setObjectName("iconBtn")
+            detail_btn.clicked.connect(self._show_announcements)
+            banner_row.addWidget(detail_btn)
+            layout.addWidget(banner)
+
         # 统计卡一行 6 张
         stats_row = QHBoxLayout()
         stats_row.setSpacing(12)
@@ -256,6 +275,28 @@ class DashboardPage(QWidget):
         self._fetch_config_key: tuple | None = None  # (auto, interval)，变化时重启定时器
 
         self.refresh()
+
+    def _show_announcements(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("更新公告")
+        dlg.resize(660, 460)
+        box = QVBoxLayout(dlg)
+        tabs = QTabWidget()
+        for item in self._announcements:
+            view = QTextBrowser()
+            view.setHtml(
+                f"<h2>{item['title']}</h2>"
+                f"<p><b>版本 {item['version']} · {item['date']}</b></p>"
+                f"<p>{item['details'].replace(chr(10), '<br>')}</p>")
+            tabs.addTab(view, f"v{item['version']}")
+        box.addWidget(tabs)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(close_btn)
+        box.addLayout(row)
+        dlg.exec()
 
     # ---------- 刷新 ----------
     def refresh(self):
@@ -438,8 +479,5 @@ class DashboardPage(QWidget):
             self.refresh()
         new_n = getattr(self, "_fetch_new", 0)
         if new_n and self.store.get("notify_replies", "1") != "0":
-            if self.main_window._tray_icon is not None:
-                self.main_window._tray_icon.showMessage(
-                    "奶龙投稿助手", f"收到 {new_n} 封新回信",
-                    self.main_window._tray_icon.Information, 4000)
+            self.main_window.notify_tray(f"收到 {new_n} 封新回信", ms=4000)
             self.main_window.set_replies_badge(new_n)

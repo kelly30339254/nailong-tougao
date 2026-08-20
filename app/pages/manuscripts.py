@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Manuscript, CATEGORIES, READER_GROUPS, EMOTIONS, STYLES
-from ..docx_reader import read_docx_text, read_txt, count_cjk_words
+from ..docx_reader import (
+    WORD_COUNT_SOURCE_LABELS, read_document_stats, read_docx_text, read_txt,
+)
 from ..widgets import mk_item, badge_cell, PagedTable, export_csv, ProgressDialog
 
 FILE_FILTER = "文稿文件 (*.docx *.txt)"
@@ -61,6 +63,15 @@ class ManuscriptDialog(QDialog):
         self.words_edit = QLineEdit(str(self.manuscript.word_count or ""))
         self.words_edit.setPlaceholderText("数字，选择文件后自动统计")
         form.addRow("字数", self.words_edit)
+        self._word_count_source = self.manuscript.word_count_source or (
+            "manual" if self.manuscript.word_count else "")
+        self._auto_word_count_text = str(self.manuscript.word_count or "")
+        self.words_source_label = QLabel()
+        self.words_source_label.setObjectName("hintText")
+        self.words_source_label.setWordWrap(True)
+        self.words_edit.textEdited.connect(self._on_words_edited)
+        form.addRow("统计来源", self.words_source_label)
+        self._refresh_word_source_label()
 
         self.category_combo = QComboBox()
         self.category_combo.setEditable(True)
@@ -178,14 +189,27 @@ class ManuscriptDialog(QDialog):
             return
         # 先读源文件统计字数，成功后才复制进数据目录（避免失败留下孤儿副本）
         try:
-            text = read_manuscript_text(path)
-            words = count_cjk_words(text)
+            stats = read_document_stats(path)
         except Exception as exc:
             QMessageBox.warning(self, "读取失败", f"无法读取文件：{exc}")
             return
         self.file_path = copy_to_files_dir(self.db.files_dir, path)
-        self.words_edit.setText(str(words))
+        self._word_count_source = stats.source
+        self._auto_word_count_text = str(stats.word_count)
+        self.words_edit.setText(self._auto_word_count_text)
+        self._refresh_word_source_label()
         self.file_label.setText(os.path.basename(self.file_path))
+
+    def _on_words_edited(self, text: str):
+        if text.strip() != self._auto_word_count_text:
+            self._word_count_source = "manual"
+        self._refresh_word_source_label()
+
+    def _refresh_word_source_label(self):
+        label = WORD_COUNT_SOURCE_LABELS.get(self._word_count_source, "未统计")
+        if self._word_count_source == "word_saved":
+            label += "（重新用 Word 保存文档可刷新此值）"
+        self.words_source_label.setText(label)
 
     def _on_save(self):
         title = self.title_edit.text().strip()
@@ -198,6 +222,7 @@ class ManuscriptDialog(QDialog):
             return
         self.manuscript.title = title
         self.manuscript.word_count = int(words_text) if words_text else 0
+        self.manuscript.word_count_source = self._word_count_source or "manual"
         self.manuscript.category = self.category_combo.currentText().strip()
         self.manuscript.reader_group = self.reader_combo.currentText()
         self.manuscript.emotion = self.emotion_combo.currentText()
@@ -310,9 +335,16 @@ class ManuscriptsPage(QWidget):
         else:
             table.setCellWidget(row, 1, badge_cell("未售", "other"))
 
-        values = [str(m.word_count or ""), m.category, m.reader_group,
+        source_label = WORD_COUNT_SOURCE_LABELS.get(m.word_count_source, "未标注")
+        word_item = mk_item(str(m.word_count or ""))
+        word_item.setToolTip(
+            f"统计来源：{source_label}" +
+            ("\n这是 Word 最后保存时的统计；重新用 Word 保存可刷新。"
+             if m.word_count_source == "word_saved" else ""))
+        table.setItem(row, 2, word_item)
+        values = [m.category, m.reader_group,
                   m.emotion, m.style, m.genre_type, m.created_at]
-        for col, text in enumerate(values, start=2):
+        for col, text in enumerate(values, start=3):
             table.setItem(row, col, mk_item(text or ""))
 
         ops = QWidget()

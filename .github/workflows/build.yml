@@ -40,6 +40,9 @@ jobs:
           fi
         shell: bash
 
+      - name: 校验版本与发版公告
+        run: python scripts/validate_release.py
+
       - name: PyInstaller 打包
         run: pyinstaller --noconfirm --clean 奶龙投稿助手.spec
 

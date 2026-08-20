@@ -133,6 +133,12 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._session_quit = False
         self._setup_tray()
+        startup_batch = self.db.get_live_batch()
+        self._startup_recovery_batch_id = (
+            startup_batch.id if startup_batch is not None
+            and startup_batch.status != "scheduled" else None)
+        if not os.environ.get("NAILONG_SMOKE") and self._startup_recovery_batch_id:
+            QTimer.singleShot(0, self._offer_batch_recovery)
 
     # ---------- 顶栏 ----------
     def _build_topbar(self) -> QWidget:
@@ -311,19 +317,39 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(ms + 200, _hide)
 
+    def notify_tray(self, message: str, title: str = "奶龙投稿助手", ms: int = 3000):
+        """系统托盘气泡。图标必须用 MessageIcon，不能写在托盘实例上。"""
+        if self._tray_icon is None:
+            return
+        self._tray_icon.showMessage(
+            title, message, QSystemTrayIcon.MessageIcon.Information, ms)
+
     def _check_scheduled(self):
-        from .workers import SendWorker
+        from .workers import BatchSendCoordinator, SendWorker
         if self._sched_worker is not None and self._sched_worker.isRunning():
+            return
+        due_batches = self.db.due_batches() or self.db.due_limit_batches()
+        if due_batches:
+            batch = due_batches[0]
+            mailboxes = self.store.load_mailboxes()
+            self.db.update_batch(batch.id, status="running", pause_reason="")
+            worker = BatchSendCoordinator(self.db, batch.id, mailboxes, self)
+            worker.batch_done.connect(
+                lambda status, bid=batch.id: self._on_scheduled_batch_done(bid, status))
+            worker.all_done.connect(lambda: setattr(self, "_sched_worker", None))
+            self._sched_worker = worker
+            worker.start()
             return
         due = self.db.due_scheduled()
         if not due:
             return
         mailboxes = [m for m in self.store.load_mailboxes()
                      if m.enabled and m.address
-                     and self.db.count_today(m.address) < m.daily_limit]
+                     and (not m.limit_enabled
+                          or self.db.count_today(m.address) < m.daily_limit)]
         if not mailboxes:
             return  # 无可用邮箱，保持待发，下次再试
-        _one, interval, _daily = self.store.get_strategy()
+        policy = self.store.get_strategy()
         jobs = []
         for s in due:
             attachment = None
@@ -336,10 +362,49 @@ class MainWindow(QMainWindow):
                          "message_id": s.message_id,
                          "attachment_path": attachment})
         self._sched_ok = self._sched_fail = self._sched_skip = 0
-        self._sched_worker = SendWorker(mailboxes, jobs, interval, self, db=self.db)
+        self._sched_worker = SendWorker(
+            mailboxes, jobs, policy.legacy_interval_seconds, self, db=self.db)
         self._sched_worker.item_done.connect(self._on_sched_item_done)
         self._sched_worker.all_done.connect(self._on_sched_all_done)
         self._sched_worker.start()
+
+    def _on_scheduled_batch_done(self, batch_id: int, status: str):
+        labels = {"completed": "完成", "paused": "暂停",
+                  "waiting": "等待处理", "cancelled": "取消"}
+        self.notify_status(f"定时投稿批次已{labels.get(status, status)}", 10000)
+        self.data_changed.emit()
+
+    def _offer_batch_recovery(self):
+        """中断批次只询问，不自动继续。"""
+        batch_id = getattr(self, "_startup_recovery_batch_id", None)
+        self._startup_recovery_batch_id = None
+        batch = self.db.get_batch(batch_id) if batch_id else None
+        if batch is None or batch.status in ("scheduled", "completed", "cancelled"):
+            return
+        if batch.status == "running":
+            self.db.update_batch(
+                batch.id, status="paused", pause_reason="程序曾在批次运行时退出")
+            batch = self.db.get_batch(batch.id)
+        uncertain = self.db.list_batch_submissions(batch.id, ("结果待确认",))
+        if uncertain:
+            QMessageBox.warning(
+                self, "发现中断的投稿批次",
+                f"“{batch.name}”有 {len(uncertain)} 封发送结果待确认。"
+                "\n为避免重复邮件，软件不会自动重发。请到投递记录逐封标记结果后再继续。")
+            self.navigate("records")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("恢复投稿批次")
+        box.setText(f"发现未完成批次“{batch.name}”，是否现在继续？")
+        continue_btn = box.addButton("继续发送", QMessageBox.AcceptRole)
+        box.addButton("保持暂停", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is continue_btn:
+            self.navigate("submit")
+            page = self._pages.get("submit")
+            if page is not None:
+                page._reload_batches(batch.id)
+                page._start_batch_coordinator(batch.id)
 
     def _on_sched_item_done(self, submission_id: int, ok: bool, error: str,
                             mailbox_address: str, skipped: bool = False):
@@ -545,7 +610,8 @@ class MainWindow(QMainWindow):
         self._tray_icon = tray
 
     def _on_tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+        reasons = QSystemTrayIcon.ActivationReason
+        if reason in (reasons.Trigger, reasons.DoubleClick):
             self._show_window()
 
     def _show_window(self):
@@ -558,6 +624,18 @@ class MainWindow(QMainWindow):
             return
         self._quitting = True
         self._force_quit = True
+        submit_page = self._pages.get("submit")
+        batch_worker = getattr(submit_page, "_batch_worker", None)
+        if batch_worker is not None and batch_worker.isRunning():
+            batch_worker.pause()
+        if self._sched_worker is not None and self._sched_worker.isRunning():
+            pause = getattr(self._sched_worker, "pause", None)
+            if callable(pause):
+                pause()
+            else:
+                stop = getattr(self._sched_worker, "stop", None)
+                if callable(stop):
+                    stop()
         tray = self._tray_icon
         self._tray_icon = None
         if tray is not None:
@@ -611,8 +689,6 @@ class MainWindow(QMainWindow):
         if self._tray_icon is not None and not self._force_quit:
             event.ignore()
             self.hide()
-            self._tray_icon.showMessage(
-                "奶龙投稿助手", "程序已最小化到托盘，点击图标可重新打开。",
-                QSystemTrayIcon.Information, 3000)
+            self.notify_tray("程序已最小化到托盘，点击图标可重新打开。")
             return
         super().closeEvent(event)

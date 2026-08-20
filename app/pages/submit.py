@@ -12,13 +12,17 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QTableWidget, QTableWidgetItem,
     QFrame, QPlainTextEdit, QFileDialog, QMessageBox, QAbstractItemView,
     QHeaderView, QTabBar, QProgressBar, QScrollArea, QDateTimeEdit,
+    QSpinBox, QDialog,
 )
 
-from ..models import Submission
-from ..letter import build_letter, personalize_letter, vary_letter
+from ..models import BatchManuscript, LetterTemplate, Submission
+from ..letter import (
+    build_letter, personalize_letter, validate_letter_template, vary_letter,
+)
 from ..docx_reader import read_docx_text, count_cjk_words
-from ..workers import SendWorker, AiRankWorker
-from ..widgets import mk_item, PageBar
+from ..workers import BatchSendCoordinator, SendWorker, AiRankWorker
+from ..widgets import mk_item, MultiSelectComboBox, PageBar
+from ..batching import BatchPlanner, format_duration_range
 from .. import smart_match
 from ..models import CATEGORIES, READER_GROUPS, EMOTIONS, STYLES
 from .manuscripts import read_manuscript_text
@@ -32,8 +36,14 @@ class SubmitPage(QWidget):
         self.store = store
         self.main_window = main_window
         self._send_worker: SendWorker | None = None
+        self._batch_worker: BatchSendCoordinator | None = None
+        self._batch_id: int | None = None
+        self._batch_items: list[BatchManuscript] = []
+        self._active_batch_item = -1
+        self._batch_loading = False
         self._temp_file_path = ""          # 临时选择的 docx（不入库）
         self._checked_ids: set[int] = set()  # 勾选的编辑 id（跨标签页保留）
+        self._checked_order: list[int] = []  # 当前稿件的配置顺序
         self._current_editors: list = []   # 当前标签页+关键词过滤后的编辑
         self._success = self._failed = self._skipped = 0
         self._ai_rank: dict[int, tuple[int, str, bool]] = {}
@@ -45,6 +55,7 @@ class SubmitPage(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(16, 16, 16, 12)
         layout.setSpacing(12)
+        layout.addWidget(self._build_batch_card())
         layout.addWidget(self._build_mail_card())
         layout.addWidget(self._build_editors_card(), 1)
 
@@ -57,6 +68,94 @@ class SubmitPage(QWidget):
         outer.addWidget(scroll)
 
         self.refresh()
+
+    def _build_batch_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("card")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(16, 14, 16, 14)
+        box.setSpacing(8)
+        head = QHBoxLayout()
+        title = QLabel("投稿批次（最多 10 篇）")
+        title.setObjectName("cardTitle")
+        head.addWidget(title)
+        self.batch_combo = QComboBox()
+        self.batch_combo.currentIndexChanged.connect(self._on_batch_changed)
+        head.addWidget(self.batch_combo, 1)
+        new_btn = QPushButton("新建草稿")
+        new_btn.clicked.connect(self._on_new_batch)
+        head.addWidget(new_btn)
+        self.batch_save_btn = QPushButton("保存草稿")
+        self.batch_save_btn.clicked.connect(self._save_active_batch)
+        head.addWidget(self.batch_save_btn)
+        delete_btn = QPushButton("删除草稿")
+        delete_btn.clicked.connect(self._on_delete_batch)
+        head.addWidget(delete_btn)
+        box.addLayout(head)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("批次名称"))
+        self.batch_name_edit = QLineEdit()
+        self.batch_name_edit.setPlaceholderText("例如：8 月短篇投稿")
+        name_row.addWidget(self.batch_name_edit, 1)
+        self.batch_status_label = QLabel("尚未选择批次")
+        self.batch_status_label.setObjectName("hintText")
+        name_row.addWidget(self.batch_status_label)
+        box.addLayout(name_row)
+
+        add_row = QHBoxLayout()
+        self.library_add_combo = QComboBox()
+        self.library_add_combo.setPlaceholderText("从文稿库选择")
+        add_row.addWidget(self.library_add_combo, 1)
+        add_btn = QPushButton("加入批次")
+        add_btn.clicked.connect(self._on_add_batch_manuscript)
+        add_row.addWidget(add_btn)
+        up_btn = QPushButton("上移")
+        up_btn.clicked.connect(lambda: self._move_batch_manuscript(-1))
+        add_row.addWidget(up_btn)
+        down_btn = QPushButton("下移")
+        down_btn.clicked.connect(lambda: self._move_batch_manuscript(1))
+        add_row.addWidget(down_btn)
+        remove_btn = QPushButton("移除")
+        remove_btn.clicked.connect(self._on_remove_batch_manuscript)
+        add_row.addWidget(remove_btn)
+        box.addLayout(add_row)
+
+        self.batch_table = QTableWidget(0, 5)
+        self.batch_table.setHorizontalHeaderLabels(
+            ["顺序", "文稿", "收件编辑", "发件邮箱", "模板组"])
+        self.batch_table.verticalHeader().setVisible(False)
+        self.batch_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.batch_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.batch_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.batch_table.setMaximumHeight(190)
+        self.batch_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.batch_table.cellClicked.connect(self._on_batch_row_clicked)
+        box.addWidget(self.batch_table)
+
+        config_row = QHBoxLayout()
+        config_row.addWidget(QLabel("本篇发件邮箱"))
+        self.batch_mailbox_combo = MultiSelectComboBox("请选择邮箱")
+        self.batch_mailbox_combo.selectionChanged.connect(self._on_batch_config_changed)
+        config_row.addWidget(self.batch_mailbox_combo, 1)
+        config_row.addWidget(QLabel("本篇模板组"))
+        self.batch_template_combo = MultiSelectComboBox("请选择模板")
+        self.batch_template_combo.selectionChanged.connect(self._on_batch_config_changed)
+        config_row.addWidget(self.batch_template_combo, 1)
+        review_btn = QPushButton("审核模板组")
+        review_btn.clicked.connect(self._review_batch_templates)
+        config_row.addWidget(review_btn)
+        self.ai_count_spin = QSpinBox()
+        self.ai_count_spin.setRange(2, 10)
+        self.ai_count_spin.setValue(5)
+        self.ai_count_spin.setSuffix(" 套")
+        config_row.addWidget(self.ai_count_spin)
+        ai_btn = QPushButton("AI 生成候选")
+        ai_btn.setToolTip("一次仅上传本篇标题和结构化标签，不上传正文")
+        ai_btn.clicked.connect(self._on_generate_batch_ai)
+        config_row.addWidget(ai_btn)
+        box.addLayout(config_row)
+        return card
 
     # ---------- 上卡片：稿件与邮件 ----------
     def _build_mail_card(self) -> QFrame:
@@ -93,6 +192,12 @@ class SubmitPage(QWidget):
         self.style_combo.addItems(STYLES)
         self.genre_edit = QLineEdit()
         self.genre_edit.setPlaceholderText("如：悬疑、言情、世情…")
+        self.title_edit.setReadOnly(True)
+        self.words_edit.setReadOnly(True)
+        self.genre_edit.setReadOnly(True)
+        for combo in (self.category_combo, self.reader_combo,
+                      self.emotion_combo, self.style_combo):
+            combo.setEnabled(False)
 
         fields = [
             ("作品名称 *", self.title_edit), ("作品字数 *", self.words_edit),
@@ -109,7 +214,11 @@ class SubmitPage(QWidget):
         box.addLayout(grid)
 
         # 邮件主题与正文
-        box.addWidget(QLabel("邮件主题"))
+        preview_hint = QLabel("下方为单封预览；批次启动时以本篇最终模板组生成并冻结每封内容。")
+        preview_hint.setObjectName("hintText")
+        preview_hint.setWordWrap(True)
+        box.addWidget(preview_hint)
+        box.addWidget(QLabel("邮件主题预览"))
         self.subject_edit = QLineEdit()
         self.subject_edit.setPlaceholderText("可手填，或点「用模板生成」自动填充")
         box.addWidget(self.subject_edit)
@@ -156,16 +265,12 @@ class SubmitPage(QWidget):
         self.platform_combo.addItem("全部平台")
         self.platform_combo.currentIndexChanged.connect(self._on_filter_changed)
         filters.addWidget(self.platform_combo)
-        self.genre_combo = QComboBox()
-        self.genre_combo.setMinimumContentsLength(8)
-        self.genre_combo.addItem("全部类型")
-        self.genre_combo.setToolTip("按稿件类型叠加筛选，例如先选短篇，再选正常收稿")
-        self.genre_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self.genre_combo = MultiSelectComboBox("全部类型")
+        self.genre_combo.setToolTip("同组任一标签匹配；与方向、平台、状态同时满足")
+        self.genre_combo.selectionChanged.connect(self._on_filter_changed)
         filters.addWidget(self.genre_combo)
-        self.direction_combo = QComboBox()
-        self.direction_combo.setMinimumContentsLength(8)
-        self.direction_combo.addItem("全部方向")
-        self.direction_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self.direction_combo = MultiSelectComboBox("全部方向")
+        self.direction_combo.selectionChanged.connect(self._on_filter_changed)
         filters.addWidget(self.direction_combo)
         self.status_combo = QComboBox()
         self.status_combo.setMinimumContentsLength(8)
@@ -269,10 +374,13 @@ class SubmitPage(QWidget):
         sched_hint = QLabel("定时需软件开着，可缩托盘")
         sched_hint.setObjectName("hintText")
         run_row.addWidget(sched_hint)
-        self.stop_btn = QPushButton("停止")
+        self.stop_btn = QPushButton("暂停")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._on_stop)
         run_row.addWidget(self.stop_btn)
+        self.cancel_batch_btn = QPushButton("取消批次")
+        self.cancel_batch_btn.clicked.connect(self._on_cancel_active_batch)
+        run_row.addWidget(self.cancel_batch_btn)
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         run_row.addWidget(self.progress_bar, 1)
@@ -285,9 +393,370 @@ class SubmitPage(QWidget):
         box.addWidget(self.log_edit)
         return card
 
+    # ---------- 批次草稿 ----------
+    def _reload_batches(self, preferred_id=None):
+        current_id = preferred_id if preferred_id is not None else self._batch_id
+        batches = self.db.list_batches(include_finished=False)
+        self._batch_loading = True
+        self.batch_combo.blockSignals(True)
+        self.batch_combo.clear()
+        labels = {
+            "draft": "草稿", "scheduled": "已定时", "running": "发送中",
+            "paused": "已暂停", "waiting": "等待处理",
+        }
+        for batch in batches:
+            self.batch_combo.addItem(
+                f"{batch.name} · {labels.get(batch.status, batch.status)}", batch.id)
+        index = self.batch_combo.findData(current_id)
+        self.batch_combo.setCurrentIndex(index if index >= 0 else (0 if batches else -1))
+        self.batch_combo.blockSignals(False)
+        self._batch_loading = False
+        self._load_batch(self.batch_combo.currentData())
+
+    def _load_batch(self, batch_id):
+        self._batch_loading = True
+        self._batch_id = int(batch_id) if batch_id else None
+        batch = self.db.get_batch(self._batch_id) if self._batch_id else None
+        self._batch_items = self.db.list_batch_manuscripts(self._batch_id) if batch else []
+        self._active_batch_item = -1
+        self.batch_name_edit.setText(batch.name if batch else "")
+        status_names = {
+            "draft": "草稿可编辑", "scheduled": f"定时：{batch.scheduled_at}" if batch else "",
+            "running": "正在发送", "paused": "已暂停，可继续",
+            "waiting": "等待限额或邮箱处理", "completed": "已完成",
+            "cancelled": "已取消",
+        }
+        self.batch_status_label.setText(status_names.get(batch.status, "尚未选择批次") if batch else "尚未选择批次")
+        editable = bool(batch and batch.status == "draft")
+        self.batch_name_edit.setEnabled(editable)
+        self.batch_save_btn.setEnabled(editable)
+        self._reload_batch_selectors()
+        self._reload_manuscript_combo()
+        self._refresh_batch_table()
+        self._batch_loading = False
+        if self._batch_items:
+            self._select_batch_item(0)
+        else:
+            self._checked_ids.clear()
+            self._checked_order.clear()
+            self._reload_editors_table()
+
+    def _reload_batch_selectors(self):
+        mailboxes = [m for m in self.store.load_mailboxes() if m.enabled and m.address]
+        self.batch_mailbox_combo.set_options([
+            (m.address, m.mailbox_id) for m in mailboxes])
+        self.batch_template_combo.set_options([
+            (template.name, str(template.id)) for template in self.db.list_letter_templates()])
+        manuscripts = self.db.list_manuscripts()
+        current = self.library_add_combo.currentData()
+        self.library_add_combo.blockSignals(True)
+        self.library_add_combo.clear()
+        for manuscript in manuscripts:
+            display = f"{manuscript.title}（{manuscript.word_count}字）"
+            self.library_add_combo.addItem(display, manuscript.id)
+            self.library_add_combo.setItemData(
+                self.library_add_combo.count() - 1, display, Qt.ToolTipRole)
+        index = self.library_add_combo.findData(current)
+        if index >= 0:
+            self.library_add_combo.setCurrentIndex(index)
+        self.library_add_combo.blockSignals(False)
+
+    def _store_current_batch_item(self):
+        index = self._active_batch_item
+        if self._batch_loading or not (0 <= index < len(self._batch_items)):
+            return
+        item = self._batch_items[index]
+        ordered = [eid for eid in self._checked_order if eid in self._checked_ids]
+        ordered.extend(sorted(self._checked_ids.difference(ordered)))
+        item.target_editor_ids = ordered
+        item.mailbox_ids = self.batch_mailbox_combo.checked_values()
+        item.template_ids = [int(value) for value in
+                             self.batch_template_combo.checked_values()]
+
+    def _select_batch_item(self, index: int):
+        if not (0 <= index < len(self._batch_items)):
+            return
+        self._store_current_batch_item()
+        self._batch_loading = True
+        self._active_batch_item = index
+        item = self._batch_items[index]
+        self._checked_ids = set(item.target_editor_ids)
+        self._checked_order = list(item.target_editor_ids)
+        self.batch_mailbox_combo.set_checked_values(item.mailbox_ids)
+        self.batch_template_combo.set_checked_values([str(i) for i in item.template_ids])
+        combo_index = self.manuscript_combo.findData(item.manuscript_id)
+        self.manuscript_combo.blockSignals(True)
+        self.manuscript_combo.setCurrentIndex(combo_index)
+        self.manuscript_combo.blockSignals(False)
+        self.batch_table.selectRow(index)
+        self._batch_loading = False
+        self._show_manuscript(item.manuscript_id)
+        self._reload_editors_table()
+
+    def _refresh_batch_table(self):
+        self.batch_table.setRowCount(len(self._batch_items))
+        mailbox_names = {m.mailbox_id: m.address for m in self.store.load_mailboxes()}
+        template_names = {t.id: t.name for t in self.db.list_letter_templates()}
+        for row, item in enumerate(self._batch_items):
+            manuscript = self.db.get_manuscript(item.manuscript_id)
+            values = [
+                str(row + 1), manuscript.title if manuscript else "已删除文稿",
+                f"{len(item.target_editor_ids)} 位",
+                "、".join(mailbox_names.get(mid, "失效邮箱") for mid in item.mailbox_ids) or "未选择",
+                ("、".join(template_names.get(tid, "失效模板") for tid in item.template_ids)
+                 + (f" + AI {sum(1 for x in item.ai_templates if x.get('selected', True))} 套"
+                    if item.ai_templates else "")) or "未选择",
+            ]
+            for col, value in enumerate(values):
+                self.batch_table.setItem(row, col, mk_item(value))
+
+    def _on_batch_changed(self):
+        if self._batch_loading:
+            return
+        self._save_active_batch(silent=True)
+        self._load_batch(self.batch_combo.currentData())
+
+    def _on_new_batch(self):
+        self._save_active_batch(silent=True)
+        batch_id = self.db.create_batch()
+        self._reload_batches(batch_id)
+
+    def _on_delete_batch(self):
+        batch = self.db.get_batch(self._batch_id) if self._batch_id else None
+        if batch is None:
+            return
+        if batch.status != "draft":
+            QMessageBox.information(self, "不能删除", "运行、定时或暂停批次请使用“取消批次”。")
+            return
+        if QMessageBox.question(self, "删除草稿", f"确定删除“{batch.name}”吗？") != QMessageBox.Yes:
+            return
+        self.db.delete_batch(batch.id)
+        self._batch_id = None
+        self._reload_batches()
+
+    def _save_active_batch(self, *_args, silent=False):
+        if not self._batch_id:
+            if not silent:
+                QMessageBox.information(self, "提示", "请先新建批次草稿。")
+            return False
+        batch = self.db.get_batch(self._batch_id)
+        if batch is None or batch.status != "draft":
+            return False
+        self._store_current_batch_item()
+        try:
+            self.db.update_batch(
+                self._batch_id,
+                name=self.batch_name_edit.text().strip() or batch.name)
+            self.db.save_batch_configuration(self._batch_id, self._batch_items)
+            active = max(0, self._active_batch_item)
+            self._batch_items = self.db.list_batch_manuscripts(self._batch_id)
+            self._reload_manuscript_combo()
+            self._refresh_batch_table()
+            if self._batch_items:
+                self._select_batch_item(min(active, len(self._batch_items) - 1))
+            if not silent:
+                self._log("批次草稿已保存。")
+            return True
+        except Exception as exc:
+            if not silent:
+                QMessageBox.warning(self, "保存失败", str(exc))
+            return False
+
+    def _on_add_batch_manuscript(self):
+        manuscript_id = self.library_add_combo.currentData()
+        if not manuscript_id:
+            QMessageBox.information(self, "提示", "文稿库为空，请先添加文稿。")
+            return
+        if not self._batch_id:
+            self._on_new_batch()
+        batch = self.db.get_batch(self._batch_id)
+        if batch is None or batch.status != "draft":
+            QMessageBox.information(self, "提示", "当前批次不可编辑，请新建草稿。")
+            return
+        self._store_current_batch_item()
+        if len(self._batch_items) >= 10:
+            QMessageBox.warning(self, "已达上限", "每个批次最多 10 篇稿件。")
+            return
+        if any(item.manuscript_id == manuscript_id for item in self._batch_items):
+            QMessageBox.information(self, "提示", "这篇文稿已在当前批次中。")
+            return
+        self._batch_items.append(BatchManuscript(
+            batch_id=self._batch_id, manuscript_id=manuscript_id,
+            position=len(self._batch_items)))
+        self._active_batch_item = len(self._batch_items) - 1
+        self._save_active_batch(silent=True)
+
+    def _on_remove_batch_manuscript(self):
+        index = self._active_batch_item
+        if not (0 <= index < len(self._batch_items)):
+            return
+        self._batch_items.pop(index)
+        self._active_batch_item = min(index, len(self._batch_items) - 1)
+        self._save_active_batch(silent=True)
+        if not self._batch_items:
+            self._reload_manuscript_combo()
+            self._refresh_batch_table()
+
+    def _move_batch_manuscript(self, delta: int):
+        index = self._active_batch_item
+        target = index + delta
+        if not (0 <= index < len(self._batch_items) and 0 <= target < len(self._batch_items)):
+            return
+        self._store_current_batch_item()
+        self._batch_items[index], self._batch_items[target] = (
+            self._batch_items[target], self._batch_items[index])
+        self._active_batch_item = target
+        self._save_active_batch(silent=True)
+
+    def _on_batch_row_clicked(self, row: int, _column: int):
+        self._select_batch_item(row)
+
+    def _on_batch_config_changed(self):
+        if self._batch_loading:
+            return
+        self._store_current_batch_item()
+        self._refresh_batch_table()
+
+    def _on_generate_batch_ai(self):
+        if not (0 <= self._active_batch_item < len(self._batch_items)):
+            QMessageBox.information(self, "提示", "请先在批次中选择一篇稿件。")
+            return
+        from ..ai_ui import require_ai_config
+        from ..workers import AiCallWorker
+        from .. import ai_smart
+        cfg = require_ai_config(self, self.store, self.main_window)
+        if cfg is None:
+            return
+        item = self._batch_items[self._active_batch_item]
+        manuscript = self.db.get_manuscript(item.manuscript_id)
+        if manuscript is None:
+            return
+        metadata = {
+            "title": manuscript.title, "word_count": manuscript.word_count,
+            "category": manuscript.category, "genre_type": manuscript.genre_type,
+            "reader_group": manuscript.reader_group, "emotion": manuscript.emotion,
+            "style": manuscript.style,
+        }
+        count = self.ai_count_spin.value()
+        self._log(f"正在为《{manuscript.title}》一次生成 {count} 套 AI 候选（不上传正文）……")
+        worker = AiCallWorker(
+            lambda: ai_smart.generate_batch_letter_templates(cfg, metadata, count), self)
+
+        def ok(candidates):
+            item.ai_templates = list(candidates)
+            self._review_batch_templates()
+
+        worker.finished_ok.connect(ok)
+        worker.failed.connect(lambda message: QMessageBox.warning(self, "生成失败", str(message)))
+        self._batch_ai_worker = worker
+        worker.start()
+
+    def _review_batch_templates(self):
+        if not (0 <= self._active_batch_item < len(self._batch_items)):
+            return
+        item = self._batch_items[self._active_batch_item]
+        rows: list[dict] = []
+        for template in self.db.list_letter_templates():
+            rows.append({
+                "kind": "library", "id": template.id, "name": template.name,
+                "subject": template.subject, "body": template.body,
+                "selected": template.id in item.template_ids,
+                "original_subject": template.subject, "original_body": template.body,
+            })
+        for candidate in item.ai_templates:
+            rows.append({"kind": "candidate", **candidate})
+        dlg = QDialog(self)
+        dlg.setWindowTitle("审核本篇最终轮换模板组")
+        dlg.resize(920, 520)
+        box = QVBoxLayout(dlg)
+        note = QLabel("勾选最终轮换组；可直接修改名称、主题和正文。缺少必需占位符时不能保存。")
+        note.setObjectName("hintText")
+        note.setWordWrap(True)
+        box.addWidget(note)
+        table = QTableWidget(len(rows), 5)
+        table.setHorizontalHeaderLabels(["选用", "名称", "主题", "正文", "来源"])
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for row, candidate in enumerate(rows):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            check.setCheckState(Qt.Checked if candidate.get("selected") else Qt.Unchecked)
+            check.setData(Qt.UserRole, candidate)
+            table.setItem(row, 0, check)
+            table.setItem(row, 1, QTableWidgetItem(str(candidate.get("name", ""))))
+            table.setItem(row, 2, QTableWidgetItem(str(candidate.get("subject", ""))))
+            table.setItem(row, 3, QTableWidgetItem(str(candidate.get("body", ""))))
+            table.setItem(row, 4, mk_item("模板库" if candidate.get("kind") == "library" else "本批 AI"))
+        box.addWidget(table, 1)
+        save_library = QCheckBox("将勾选且经过编辑的批次候选另存到模板库")
+        box.addWidget(save_library)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(dlg.reject)
+        buttons.addWidget(cancel)
+        accept = QPushButton("保存最终模板组")
+        accept.setObjectName("primaryBtn")
+        buttons.addWidget(accept)
+        box.addLayout(buttons)
+
+        def apply_review():
+            template_ids: list[int] = []
+            candidates: list[dict] = []
+            problems: list[str] = []
+            for row in range(table.rowCount()):
+                if table.item(row, 0).checkState() != Qt.Checked:
+                    continue
+                original = table.item(row, 0).data(Qt.UserRole) or {}
+                name = table.item(row, 1).text().strip() or f"候选 {row + 1}"
+                subject = table.item(row, 2).text()
+                body = table.item(row, 3).text()
+                issues = validate_letter_template(subject, body)
+                if issues:
+                    problems.append(f"{name}：{'；'.join(issues)}")
+                    continue
+                unchanged_library = (
+                    original.get("kind") == "library"
+                    and subject == original.get("original_subject")
+                    and body == original.get("original_body"))
+                if unchanged_library:
+                    template_ids.append(int(original["id"]))
+                    continue
+                candidate = {
+                    "name": name, "subject": subject, "body": body,
+                    "selected": True,
+                    "origin": "ai" if original.get("kind") == "candidate" else "edited-library",
+                }
+                if save_library.isChecked():
+                    template_ids.append(self.db.insert_letter_template(LetterTemplate(
+                        name=name, subject=subject, body=body, origin="user")))
+                else:
+                    candidates.append(candidate)
+            if problems:
+                QMessageBox.warning(dlg, "模板不能使用", "\n".join(problems))
+                return
+            if not template_ids and not candidates:
+                QMessageBox.warning(dlg, "提示", "至少勾选一套最终模板。")
+                return
+            item.template_ids = list(dict.fromkeys(template_ids))
+            item.ai_templates = candidates
+            self._batch_template_combo_refresh(item)
+            self._save_active_batch(silent=True)
+            dlg.accept()
+
+        accept.clicked.connect(apply_review)
+        dlg.exec()
+
+    def _batch_template_combo_refresh(self, item):
+        self._batch_loading = True
+        self.batch_template_combo.set_options([
+            (template.name, str(template.id)) for template in self.db.list_letter_templates()])
+        self.batch_template_combo.set_checked_values([str(i) for i in item.template_ids])
+        self._batch_loading = False
+
     # ---------- refresh ----------
     def refresh(self):
-        self._reload_manuscript_combo()
+        self._reload_batches()
         self._reload_filter_combos()
         self._reload_editors_table()
 
@@ -302,8 +771,8 @@ class SubmitPage(QWidget):
 
     def _reload_filter_combos(self):
         self._fill_combo(self.platform_combo, "全部平台", self.db.distinct_platforms())
-        self._fill_combo(self.genre_combo, "全部类型", self.db.distinct_genres())
-        self._fill_combo(self.direction_combo, "全部方向", self.db.distinct_directions())
+        self.genre_combo.set_options(self.db.distinct_genres())
+        self.direction_combo.set_options(self.db.distinct_directions())
         self._fill_combo(self.status_combo, "全部状态", self.db.distinct_statuses())
 
     def _on_tab_changed(self, *_args):
@@ -325,13 +794,16 @@ class SubmitPage(QWidget):
         current_id = self.manuscript_combo.currentData()
         self.manuscript_combo.blockSignals(True)
         self.manuscript_combo.clear()
-        for i, m in enumerate(self.db.list_manuscripts()):
+        for item in self._batch_items:
+            m = self.db.get_manuscript(item.manuscript_id)
+            if m is None:
+                continue
             display = f"{m.title} ({m.word_count}字)"
             self.manuscript_combo.addItem(display, m.id)
-            self.manuscript_combo.setItemData(i, display, Qt.ToolTipRole)
-        self.manuscript_combo.addItem("＋临时选择 .docx 文件…", TEMP_ITEM_DATA)
+            self.manuscript_combo.setItemData(
+                self.manuscript_combo.count() - 1, display, Qt.ToolTipRole)
         idx = self.manuscript_combo.findData(current_id)
-        self.manuscript_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.manuscript_combo.setCurrentIndex(idx if idx >= 0 else (0 if self.manuscript_combo.count() else -1))
         self.manuscript_combo.blockSignals(False)
         # 首次进入且表单为空时，自动带出当前选中文稿的信息
         data = self.manuscript_combo.currentData()
@@ -369,16 +841,20 @@ class SubmitPage(QWidget):
     def _reload_editors_table(self):
         keyword = self.filter_edit.text().strip().lower()
         platform = self._combo_value(self.platform_combo, "全部平台")
-        genre = self._combo_value(self.genre_combo, "全部类型")
-        direction = self._combo_value(self.direction_combo, "全部方向")
+        genres = {value.casefold() for value in self.genre_combo.checked_values()}
+        directions = {value.casefold() for value in self.direction_combo.checked_values()}
         status = self._combo_value(self.status_combo, "全部状态")
         editors = self._tab_editors()
         if platform:
             editors = [e for e in editors if (e.platform or "").strip() == platform]
-        if genre:
-            editors = [e for e in editors if genre in (e.genres or "")]
-        if direction:
-            editors = [e for e in editors if direction in (e.directions or "")]
+        if genres:
+            editors = [e for e in editors
+                       if genres.intersection(
+                           tag.casefold() for tag in self.db._split_tags(e.genres or ""))]
+        if directions:
+            editors = [e for e in editors
+                       if directions.intersection(
+                           tag.casefold() for tag in self.db._split_tags(e.directions or ""))]
         if status:
             editors = [e for e in editors if (e.status or "").strip().startswith(status)
                        or status in (e.status or "")]
@@ -547,8 +1023,12 @@ class SubmitPage(QWidget):
             return
         if item.checkState() == Qt.Checked:
             self._checked_ids.add(editor_id)
+            if editor_id not in self._checked_order:
+                self._checked_order.append(editor_id)
         else:
             self._checked_ids.discard(editor_id)
+            if editor_id in self._checked_order:
+                self._checked_order.remove(editor_id)
         self._update_checked_label()
 
     def _update_checked_label(self):
@@ -559,26 +1039,35 @@ class SubmitPage(QWidget):
             editors_by_id = getattr(self, "_editors_lookup", None) or {
                 e.id: e for e in self.db.list_editors(include_blacklisted=True)}
             manuscript_id = self._current_manuscript_id()
-            one_draft, _interval, _daily = self.store.get_strategy()
-            protect = bool(one_draft and manuscript_id is not None)
+            policy = self.store.get_strategy()
+            protect = bool(policy.one_draft_protection and manuscript_id is not None)
             seen_platforms: set[str] = set()
+            seen_addresses: set[str] = set()
             skip_dup = skip_protect = 0
-            for editor_id in sorted(self._checked_ids):
+            preview_order = [eid for eid in self._checked_order if eid in self._checked_ids]
+            preview_order.extend(sorted(self._checked_ids.difference(preview_order)))
+            for editor_id in preview_order:
                 editor = editors_by_id.get(editor_id)
                 if editor is None or editor.blacklisted or editor.email_invalid:
                     skip_dup += 1
                     continue
-                platform = (editor.platform or "").strip()
+                address = (editor.email or "").strip().casefold()
+                if not address or address in seen_addresses:
+                    skip_dup += 1
+                    continue
+                platform = (editor.platform or "").strip().casefold()
                 if platform and platform in seen_platforms:
                     skip_dup += 1
                     continue
-                if platform:
-                    seen_platforms.add(platform)
                 if protect and self.db.find_pending(manuscript_id, editor_id) is not None:
                     skip_protect += 1
+                    continue
+                seen_addresses.add(address)
+                if platform:
+                    seen_platforms.add(platform)
             parts = []
             if skip_dup:
-                parts.append(f"同平台将跳过 {skip_dup} 家")
+                parts.append(f"同平台/失效/重复将跳过 {skip_dup} 家")
             if skip_protect:
                 parts.append(f"一稿一投将跳过 {skip_protect} 家")
             if parts:
@@ -589,12 +1078,17 @@ class SubmitPage(QWidget):
         for e in self._current_editors:
             if checked:
                 self._checked_ids.add(e.id)
+                if e.id not in self._checked_order:
+                    self._checked_order.append(e.id)
             else:
                 self._checked_ids.discard(e.id)
+                if e.id in self._checked_order:
+                    self._checked_order.remove(e.id)
         self._reload_editors_table()
 
     def _on_clear_checked(self):
         self._checked_ids.clear()
+        self._checked_order.clear()
         self.select_all_check.setChecked(False)
         self._reload_editors_table()
 
@@ -661,6 +1155,7 @@ class SubmitPage(QWidget):
         for eid, item in self._ai_rank.items():
             if item[2] and eid not in self._checked_ids:
                 self._checked_ids.add(eid)
+                self._checked_order.append(eid)
                 added += 1
         self._reload_editors_table()
         if added:
@@ -673,26 +1168,18 @@ class SubmitPage(QWidget):
 
     # ---------- 文稿选择 ----------
     def _on_manuscript_changed(self, index: int):
+        if self._batch_loading:
+            return
         data = self.manuscript_combo.itemData(index)
         if data is None:
             return
-        if data == TEMP_ITEM_DATA:
-            path, _ = QFileDialog.getOpenFileName(self, "临时选择文稿", "", "文稿文件 (*.docx *.txt)")
-            if not path:
-                self._reload_manuscript_combo()
+        for item_index, item in enumerate(self._batch_items):
+            if item.manuscript_id == data:
+                self._select_batch_item(item_index)
                 return
-            try:
-                text = read_manuscript_text(path)
-            except Exception as exc:
-                QMessageBox.warning(self, "读取失败", f"无法读取文件：{exc}")
-                self._reload_manuscript_combo()
-                return
-            self._temp_file_path = path
-            self.title_edit.setText(os.path.splitext(os.path.basename(path))[0])
-            self.words_edit.setText(str(count_cjk_words(text)))
-            self._reload_editors_table()
-            return
-        manuscript = self.db.get_manuscript(data)
+
+    def _show_manuscript(self, manuscript_id: int):
+        manuscript = self.db.get_manuscript(manuscript_id)
         if manuscript is None:
             return
         self._temp_file_path = ""
@@ -708,18 +1195,17 @@ class SubmitPage(QWidget):
         self.genre_edit.setText(manuscript.genre_type or "")
         self._ai_rank = {}
         self.ai_pick_btn.setEnabled(False)
-        self._reload_editors_table()
 
     def _current_manuscript_id(self) -> int | None:
         data = self.manuscript_combo.currentData()
-        return data if data and data != TEMP_ITEM_DATA else None
+        return data if data else None
 
     def _current_attachment(self) -> str:
         mid = self._current_manuscript_id()
         if mid:
             m = self.db.get_manuscript(mid)
             return (m.file_path or "") if m else ""
-        return self._temp_file_path
+        return ""
 
     # ---------- 生成投稿信 ----------
     def _on_build_letter(self):
@@ -807,7 +1293,8 @@ class SubmitPage(QWidget):
 
     def _build_jobs(self, status: str, scheduled_at: str = "") -> tuple[list, int]:
         """逐编辑原子建任务，并保存该编辑实际收到的个性化内容。"""
-        one_draft, _interval, _daily = self.store.get_strategy()
+        policy = self.store.get_strategy()
+        one_draft = policy.one_draft_protection
         manuscript_id = self._current_manuscript_id()
         if one_draft and not manuscript_id:
             self._log("提示：未关联文稿，本次一稿一投保护未生效（同一编辑可重复投递）。")
@@ -885,64 +1372,148 @@ class SubmitPage(QWidget):
         starter(jobs, skipped)
 
     def _on_schedule(self):
-        """定时投递：同样校验与跳过逻辑，状态插 定时待发。"""
-        if not self._validate_ready():
+        if not self._batch_id:
+            QMessageBox.information(self, "提示", "请先新建批次并加入文稿。")
+            return
+        batch = self.db.get_batch(self._batch_id)
+        if batch is None or batch.status != "draft":
+            QMessageBox.information(self, "提示", "只有草稿批次可以设置启动时间。")
+            return
+        if not self._save_active_batch(silent=True):
             return
         scheduled_at = self.schedule_edit.dateTime().toString("yyyy-MM-dd HH:mm") + ":00"
-        jobs, skipped = self._build_jobs("定时待发", scheduled_at)
-
-        def finish(ready_jobs, skipped_n):
-            if not ready_jobs:
-                self._log("没有可投递的编辑（全部被跳过）。")
-                return
-            time_text = self.schedule_edit.dateTime().toString("yyyy-MM-dd HH:mm")
-            self._log(f"已加入定时队列 {len(ready_jobs)} 封，将于 {time_text} 发出"
-                      + (f"（跳过 {skipped_n} 家）" if skipped_n else ""))
-            self.main_window.data_changed.emit()
-            self._reload_editors_table()
-
-        self._run_jobs_after_vary(jobs, skipped, finish)
+        planner = BatchPlanner(self.db, self.store)
+        preflight = planner.preflight(self._batch_id)
+        if not self._confirm_preflight(preflight, scheduled_at=scheduled_at):
+            return
+        try:
+            _final, ids = planner.activate(self._batch_id, scheduled_at=scheduled_at)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法定时", str(exc))
+            return
+        self._log(f"批次已冻结 {len(ids)} 封，将于 {scheduled_at[:16]} 启动。")
+        self.main_window.data_changed.emit()
+        self._reload_batches(self._batch_id)
 
     def _on_start(self):
-        if not self._validate_ready():
+        if not self._batch_id:
+            QMessageBox.information(self, "提示", "请先新建批次并从文稿库加入 1–10 篇稿件。")
             return
-
-        # 单日上限：每邮箱今日已发 < 该邮箱单日上限 才参与本轮
-        mailboxes = [m for m in self.store.load_mailboxes() if m.enabled and m.address]
-        available = [m for m in mailboxes if self.db.count_today(m.address) < m.daily_limit]
-        if not available:
-            QMessageBox.warning(self, "提示", "所有已启用邮箱今日投递已达上限，请明天再试。")
+        batch = self.db.get_batch(self._batch_id)
+        if batch is None:
             return
-
-        jobs, skipped = self._build_jobs("待发")
-
-        def start_send(ready_jobs, skipped_n):
-            if not ready_jobs:
-                self._log("没有可投递的编辑（全部被跳过）。")
+        if batch.status == "scheduled":
+            QMessageBox.information(self, "已定时", f"该批次将在 {batch.scheduled_at} 启动。")
+            return
+        if batch.status == "running" and self._batch_worker is not None:
+            QMessageBox.information(self, "提示", "该批次正在发送。")
+            return
+        if batch.status == "draft":
+            if not self._save_active_batch(silent=True):
                 return
-            _one_draft, interval_seconds, _daily = self.store.get_strategy()
-            self._success = self._failed = 0
-            self._skipped = skipped_n
-            self._failed_jobs = []
-            self.progress_bar.setMaximum(len(ready_jobs))
-            self.progress_bar.setValue(0)
-            self._log(f"开始投递 {len(ready_jobs)} 封，使用 {len(available)} 个邮箱轮转……")
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
-            self._send_worker = SendWorker(available, ready_jobs, interval_seconds, self, db=self.db)
-            self._send_worker.progress.connect(self._on_send_progress)
-            self._send_worker.item_done.connect(self._on_item_done)
-            self._send_worker.all_done.connect(self._on_all_done)
-            self._last_jobs = ready_jobs
-            self._send_worker.start()
+            planner = BatchPlanner(self.db, self.store)
+            preflight = planner.preflight(self._batch_id)
+            if not self._confirm_preflight(preflight):
+                return
+            try:
+                _final, ids = planner.activate(self._batch_id)
+            except Exception as exc:
+                QMessageBox.warning(self, "无法启动", str(exc))
+                return
+            self._skipped = preflight.skipped_total + max(0, preflight.total - len(ids))
+        elif batch.status not in ("paused", "waiting", "running"):
+            QMessageBox.information(self, "提示", "当前批次不能继续。")
+            return
+        self._start_batch_coordinator(self._batch_id)
 
-        self._run_jobs_after_vary(jobs, skipped, start_send)
+    def _confirm_preflight(self, preflight, scheduled_at: str = "") -> bool:
+        if preflight.errors:
+            QMessageBox.warning(self, "预检未通过", "\n".join(preflight.errors))
+            return False
+        mailbox_names = {m.mailbox_id: m.address for m in self.store.load_mailboxes()}
+        lines = []
+        for item in preflight.manuscripts:
+            skips = "、".join(f"{key} {value}" for key, value in item.skipped.items())
+            lines.append(f"《{item.title}》：有效 {item.effective} 位"
+                         + (f"；跳过 {skips}" if skips else ""))
+        lines.append("")
+        lines.append(f"实际总封数：{preflight.total}")
+        lines.append("邮箱任务量：" + "；".join(
+            f"{mailbox_names.get(mid, mid)} {count} 封"
+            for mid, count in preflight.mailbox_counts.items()))
+        lines.append("预计完成时间：" + format_duration_range(
+            preflight.min_duration_seconds, preflight.max_duration_seconds))
+        if scheduled_at:
+            lines.append(f"整个批次启动时间：{scheduled_at}")
+        lines.append("")
+        lines.append("本地无上限、随机间隔和模板变化不能取消服务商限流，也不保证送达或规避风控。")
+        if os.environ.get("NAILONG_SMOKE") or os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            return True
+        return QMessageBox.question(
+            self, "确认物化投稿批次", "\n".join(lines),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    def _start_batch_coordinator(self, batch_id: int):
+        if self._batch_worker is not None and self._batch_worker.isRunning():
+            return
+        mailboxes = self.store.load_mailboxes()
+        pending = self.db.list_batch_submissions(
+            batch_id, BatchSendCoordinator.PENDING_STATUSES)
+        self._success = self._failed = 0
+        self.progress_bar.setRange(0, max(1, len(pending)))
+        self.progress_bar.setValue(0)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._log(f"批次开始：{len(pending)} 封；各邮箱首封并行，后续随机等待 1–3 分钟。")
+        worker = BatchSendCoordinator(self.db, batch_id, mailboxes, self)
+        worker.progress.connect(self._on_send_progress)
+        worker.item_done.connect(self._on_batch_item_done)
+        worker.mailbox_paused.connect(
+            lambda mailbox_id, reason: self._log(f"邮箱已暂停：{mailbox_id}：{reason}"))
+        worker.batch_done.connect(self._on_batch_done)
+        self._batch_worker = worker
+        worker.start()
+
+    def _on_batch_item_done(self, submission_id: int, status: str,
+                            error: str, mailbox_address: str):
+        if status == "已发":
+            self._success += 1
+        elif status == "失败":
+            self._failed += 1
+            self._log(f"单封失败（{mailbox_address}）：{error}")
+
+    def _on_batch_done(self, status: str):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._batch_worker = None
+        labels = {"completed": "完成", "paused": "暂停", "waiting": "等待处理",
+                  "cancelled": "取消"}
+        self._log(f"批次{labels.get(status, status)}：成功 {self._success}，失败 {self._failed}。")
+        self.main_window.data_changed.emit()
+        self._reload_batches(self._batch_id)
 
     def _on_stop(self):
-        if self._send_worker is not None:
+        if self._batch_worker is not None:
+            self._batch_worker.pause()
+            self.stop_btn.setEnabled(False)
+            self._log("正在暂停；当前 SMTP 调用结束后不再领取新任务……")
+        elif self._send_worker is not None:
             self._send_worker.stop()
             self.stop_btn.setEnabled(False)
-            self._log("正在停止……")
+
+    def _on_cancel_active_batch(self):
+        if not self._batch_id:
+            return
+        if not (os.environ.get("NAILONG_SMOKE") or os.environ.get("QT_QPA_PLATFORM") == "offscreen"):
+            if QMessageBox.question(
+                    self, "取消批次", "取消后所有未发送任务都不会再领取，确定继续吗？") != QMessageBox.Yes:
+                return
+        if self._batch_worker is not None:
+            self._batch_worker.cancel()
+        else:
+            self.db.cancel_batch(self._batch_id)
+            self.main_window.data_changed.emit()
+            self._reload_batches(self._batch_id)
 
     def _on_send_progress(self, current: int, total: int, message: str):
         self.progress_bar.setMaximum(max(total, 1))

@@ -39,6 +39,7 @@ class Manuscript:
     emotion: str = ""
     style: str = ""
     genre_type: str = ""
+    word_count_source: str = ""   # word_saved / compatible / manual
     created_at: str = ""
 
 
@@ -58,6 +59,18 @@ class Submission:
     scheduled_at: str = ""
     message_id: str = ""
     last_error: str = ""          # 最近一次失败原因（发送失败/跳过原因）
+    batch_id: int | None = None
+    batch_manuscript_id: int | None = None
+    assigned_mailbox_id: str = ""
+    queue_order: int = 0
+    attachment_path: str = ""
+    template_source: str = ""
+    allowed_mailbox_ids: list[str] = field(default_factory=list)
+    attempt_count: int = 0
+    next_attempt_at: str = ""
+    manuscript_title_snapshot: str = ""
+    editor_name_snapshot: str = ""
+    editor_platform_snapshot: str = ""
 
 
 @dataclass
@@ -100,6 +113,7 @@ class Sale:
 
 @dataclass
 class MailboxConfig:
+    mailbox_id: str = ""
     enabled: bool = False
     provider: str = "QQ邮箱"
     address: str = ""
@@ -110,7 +124,80 @@ class MailboxConfig:
     smtp_ssl: bool = True
     imap_host: str = ""
     imap_port: int = 993
+    limit_enabled: bool = False
     daily_limit: int = 20
+
+
+@dataclass(frozen=True)
+class DeliveryPolicy:
+    """命名化投递策略；新批次始终使用 60–180 秒随机间隔。
+
+    ``legacy_*`` 仅供旧页面/旧冒烟测试在迁移期读取，不参与新批次调度。
+    """
+
+    one_draft_protection: bool = True
+    min_interval_seconds: int = 60
+    max_interval_seconds: int = 180
+    legacy_interval_seconds: int = 45
+    legacy_daily_limit: int = 30
+
+    def __iter__(self):
+        yield self.one_draft_protection
+        yield self.legacy_interval_seconds
+        yield self.legacy_daily_limit
+
+    def __getitem__(self, index: int):
+        return tuple(self)[index]
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        if isinstance(other, DeliveryPolicy):
+            return (
+                self.one_draft_protection == other.one_draft_protection
+                and self.min_interval_seconds == other.min_interval_seconds
+                and self.max_interval_seconds == other.max_interval_seconds
+                and self.legacy_interval_seconds == other.legacy_interval_seconds
+                and self.legacy_daily_limit == other.legacy_daily_limit
+            )
+        return NotImplemented
+
+
+@dataclass
+class LetterTemplate:
+    id: int | None = None
+    name: str = ""
+    subject: str = ""
+    body: str = ""
+    origin: str = "user"          # builtin / legacy / user
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class SubmissionBatch:
+    id: int | None = None
+    name: str = ""
+    status: str = "draft"         # draft / scheduled / running / paused / waiting / completed / cancelled
+    scheduled_at: str = ""
+    random_seed: str = ""
+    pause_reason: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+
+
+@dataclass
+class BatchManuscript:
+    id: int | None = None
+    batch_id: int | None = None
+    manuscript_id: int | None = None
+    position: int = 0
+    mailbox_ids: list[str] = field(default_factory=list)
+    template_ids: list[int] = field(default_factory=list)
+    ai_templates: list[dict] = field(default_factory=list)
+    target_editor_ids: list[int] = field(default_factory=list)
 
 
 @dataclass

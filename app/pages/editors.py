@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..models import Editor
-from ..widgets import mk_item, ProgressDialog
+from ..widgets import mk_item, MultiSelectComboBox, ProgressDialog
 from ..icons import make_icon
 from ..theme import theme_colors
 from .. import updater
@@ -141,11 +141,11 @@ class EditorsPage(QWidget):
         self.platform_combo = QComboBox()
         self.platform_combo.currentIndexChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.platform_combo)
-        self.genre_combo = QComboBox()
-        self.genre_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self.genre_combo = MultiSelectComboBox("全部题材")
+        self.genre_combo.selectionChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.genre_combo)
-        self.direction_combo = QComboBox()
-        self.direction_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self.direction_combo = MultiSelectComboBox("全部方向")
+        self.direction_combo.selectionChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self.direction_combo)
         self.blacklist_combo = QComboBox()
         self.blacklist_combo.addItems(["正常编辑", "小黑屋", "全部编辑"])
@@ -259,10 +259,8 @@ class EditorsPage(QWidget):
         keyword = self.search_edit.text().strip() or None
         platform = self.platform_combo.currentText()
         platform = None if platform in ("", "全部平台") else platform
-        genre = self.genre_combo.currentText()
-        genre = None if genre in ("", "全部题材") else genre
-        direction = self.direction_combo.currentText()
-        direction = None if direction in ("", "全部方向") else direction
+        genre = self.genre_combo.checked_values()
+        direction = self.direction_combo.checked_values()
         editors = self.db.list_editors(
             keyword=keyword, platform=platform, genre=genre, direction=direction,
             favorites_only=self.fav_check.isChecked(), include_blacklisted=True)
@@ -293,21 +291,8 @@ class EditorsPage(QWidget):
         self.platform_combo.setCurrentText(platform if platform else "全部平台")
         self.platform_combo.blockSignals(False)
 
-        genre = self.genre_combo.currentText()
-        self.genre_combo.blockSignals(True)
-        self.genre_combo.clear()
-        self.genre_combo.addItem("全部题材")
-        self.genre_combo.addItems(self.db.distinct_genres())
-        self.genre_combo.setCurrentText(genre if genre else "全部题材")
-        self.genre_combo.blockSignals(False)
-
-        direction = self.direction_combo.currentText()
-        self.direction_combo.blockSignals(True)
-        self.direction_combo.clear()
-        self.direction_combo.addItem("全部方向")
-        self.direction_combo.addItems(self.db.distinct_directions())
-        self.direction_combo.setCurrentText(direction if direction else "全部方向")
-        self.direction_combo.blockSignals(False)
+        self.genre_combo.set_options(self.db.distinct_genres())
+        self.direction_combo.set_options(self.db.distinct_directions())
 
         self._reload_table()
 

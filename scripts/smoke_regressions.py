@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from app import mailer, receiver
 from app.db import Database
@@ -67,13 +67,20 @@ check("QQ服务器默认填入", card.smtp_host_edit.text() == "smtp.qq.com"
       and not card.smtp_host_edit.isEnabled())
 settings_page.interval_spin.setValue(73)
 QTest.qWait(850)
-check("设置自动保存", store.get_strategy()[1] == 73
+policy = store.get_strategy()
+check("设置自动保存及命名策略", policy.legacy_interval_seconds == 73
+      and policy.min_interval_seconds == 60 and policy.max_interval_seconds == 180
       and settings_page.save_hint.text() == "已保存")
 
 # 智选只排序并解释
 submit_page.refresh()
-index = submit_page.manuscript_combo.findData(manuscript_id)
-submit_page.manuscript_combo.setCurrentIndex(index)
+submit_page._on_new_batch()
+submit_page.library_add_combo.setCurrentIndex(
+    submit_page.library_add_combo.findData(manuscript_id))
+submit_page._on_add_batch_manuscript()
+check("文稿已加入持久化批次",
+      submit_page._batch_id is not None
+      and submit_page.manuscript_combo.findData(manuscript_id) >= 0)
 submit_page.smart_check.setChecked(True)
 check("智选匹配排序", submit_page._current_editors[0].id == editor_a
       and "题材：悬疑" in submit_page.table.item(0, 12).text())
@@ -294,8 +301,10 @@ original_send = mailer.send_mail
 mailer.send_mail = lambda mailbox, *_args, **_kwargs: sent_by.append(mailbox.address)
 try:
     send_worker = SendWorker([
-        MailboxConfig(enabled=True, address="sender@qq.com", daily_limit=1),
-        MailboxConfig(enabled=True, address="second@qq.com", daily_limit=1),
+        MailboxConfig(enabled=True, address="sender@qq.com", daily_limit=1,
+                      limit_enabled=True),
+        MailboxConfig(enabled=True, address="second@qq.com", daily_limit=1,
+                      limit_enabled=True),
     ], [{"submission_id": fallback_submission, "to": "fallback@example.com"}],
        0, db=db)
     send_worker.run()
@@ -312,6 +321,23 @@ check("应用身份常量", APP_USER_MODEL_ID == "com.nailong.tougao")
 apply_windows_app_id()
 check("托盘退出能解析 QApplication", MainWindowQApp is QApplication)
 check("托盘退出函数已接线", callable(getattr(win, "_quit_app", None)))
+check("托盘图标枚举走 MessageIcon",
+      hasattr(QSystemTrayIcon.MessageIcon, "Information"))
+old_tray = win._tray_icon
+win._tray_icon = None
+win.notify_tray("should not raise")
+called = {}
+
+class _FakeTray:
+    def showMessage(self, title, message, icon, ms):
+        called["args"] = (title, message, icon, ms)
+
+win._tray_icon = _FakeTray()
+win.notify_tray("收到 1 封新回信", ms=4000)
+check("托盘通知不读实例 Information",
+      called["args"][1] == "收到 1 封新回信"
+      and called["args"][2] == QSystemTrayIcon.MessageIcon.Information)
+win._tray_icon = old_tray
 from PySide6.QtGui import QCloseEvent
 session_event = QCloseEvent()
 win._session_quit = True

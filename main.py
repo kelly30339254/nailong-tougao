@@ -21,10 +21,10 @@ from app.logging_setup import setup_logging, install_excepthook, get_logger
 def _make_window():
     db = Database()
     store = SettingsStore(db)
-    # 回收崩溃残留的「发送中」（超过 30 分钟回退为待发，释放日额度与一稿一投）
+    # 所有崩溃残留统一改为“结果待确认”，避免 SMTP 已成功但数据库未回写造成重复。
     recovered = db.recover_stuck_sending()
     if recovered:
-        print(f"已回收 {recovered} 条中断的发送中记录")
+        print(f"已处理 {recovered} 条中断的发送中记录")
     from app.builtin_pack import default_pack_path
     seed_path = default_pack_path()
     # 按内置包版本增量播种：新装全量导入，升级只补缺失项。

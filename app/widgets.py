@@ -5,7 +5,8 @@ import csv
 import json
 import logging
 
-from PySide6.QtCore import Qt, Signal, QObject, QEvent
+from PySide6.QtCore import Qt, Signal, QObject, QEvent, QTimer
+from PySide6.QtGui import QStandardItem
 from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QWidget, QHBoxLayout, QLabel, QFrame,
     QDialog, QVBoxLayout, QProgressBar, QPushButton, QFileDialog, QMessageBox,
@@ -15,6 +16,92 @@ from PySide6.QtWidgets import (
 
 _log = logging.getLogger(__name__)
 PAGE_SIZES = (50, 100, 200)
+
+
+class MultiSelectComboBox(QComboBox):
+    """紧凑多选下拉框；值使用完整拆分标签，不做子串匹配。"""
+
+    selectionChanged = Signal()
+
+    def __init__(self, all_text: str = "全部", parent=None):
+        super().__init__(parent)
+        self.all_text = all_text
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText(all_text)
+        self.view().pressed.connect(self._toggle_index)
+        # QComboBox 会在 pressed 之后把当前项文本写回编辑框，下一事件轮再恢复汇总文案。
+        self.activated.connect(lambda *_: QTimer.singleShot(0, self._update_text))
+        self.setMinimumContentsLength(8)
+
+    def set_options(self, values):
+        selected = set(self.checked_values())
+        self.blockSignals(True)
+        self.clear()
+        for raw in values:
+            if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+                text, value = str(raw[0]).strip(), str(raw[1])
+            else:
+                text = str(raw).strip()
+                value = text
+            if not text:
+                continue
+            self.addItem(text, value)
+            item = self.model().item(self.count() - 1)
+            if isinstance(item, QStandardItem):
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setData(
+                    Qt.Checked if value in selected else Qt.Unchecked,
+                    Qt.CheckStateRole)
+        self.blockSignals(False)
+        self._update_text()
+
+    def checked_values(self) -> list[str]:
+        result: list[str] = []
+        for row in range(self.count()):
+            item = self.model().item(row)
+            if item is not None and item.data(Qt.CheckStateRole) == Qt.Checked:
+                result.append(str(self.itemData(row) or self.itemText(row)))
+        return result
+
+    def set_checked_values(self, values):
+        wanted = {str(value) for value in (values or [])}
+        for row in range(self.count()):
+            item = self.model().item(row)
+            if item is not None:
+                value = str(self.itemData(row) or self.itemText(row))
+                item.setData(Qt.Checked if value in wanted else Qt.Unchecked,
+                             Qt.CheckStateRole)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def clear_checked(self):
+        self.set_checked_values([])
+
+    def setCurrentText(self, text: str):
+        # 兼容旧页面和自动化："全部…"清空，其余选中单个值。
+        if not text or text == self.all_text or text.startswith("全部"):
+            self.set_checked_values([])
+        else:
+            self.set_checked_values([text])
+
+    def _toggle_index(self, index):
+        item = self.model().itemFromIndex(index)
+        if item is None:
+            return
+        item.setData(
+            Qt.Unchecked if item.data(Qt.CheckStateRole) == Qt.Checked else Qt.Checked,
+            Qt.CheckStateRole)
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _update_text(self):
+        values = self.checked_values()
+        text = "、".join(values) if values else self.all_text
+        if len(text) > 26:
+            text = f"已选 {len(values)} 项"
+        self.lineEdit().setText(text)
+        self.setToolTip("、".join(values) if values else self.all_text)
 
 
 def mk_item(text: str, align=None) -> QTableWidgetItem:

@@ -5,8 +5,13 @@ import csv
 import io
 import logging
 import os
+import random
 import shutil
 import time
+import threading
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as wait_futures
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QThread, Signal
 
@@ -214,7 +219,9 @@ class SendWorker(QThread):
                     for offset in range(len(self.mailboxes)):
                         candidate = self.mailboxes[(start + offset) % len(self.mailboxes)]
                         if self.db.reserve_daily_send(
-                                sid, candidate.address, candidate.daily_limit):
+                                sid, candidate.address,
+                                candidate.daily_limit if candidate.limit_enabled else None,
+                                candidate.mailbox_id):
                             selected = candidate
                             break
                     if selected is None:
@@ -261,6 +268,312 @@ class SendWorker(QThread):
                 deadline = time.time() + self.interval_seconds
                 while time.time() < deadline and not self._stopped:
                     time.sleep(0.1)
+        self.all_done.emit()
+
+
+class BatchSendCoordinator(QThread):
+    """一个批次、每邮箱一条串行队列；邮箱之间并行。"""
+
+    progress = Signal(int, int, str)
+    item_done = Signal(int, str, str, str)  # id, status, error, mailbox address
+    mailbox_paused = Signal(str, str)       # mailbox id, reason
+    batch_done = Signal(str)                # completed / paused / waiting / cancelled
+    all_done = Signal()
+
+    PENDING_STATUSES = (
+        "待发", "定时待发", "等待限额", "等待用户处理", "重试等待")
+
+    def __init__(self, db, batch_id: int, mailboxes: list[MailboxConfig], parent=None,
+                 *, rng=None, sleep_fn=None, now_fn=None, send_fn=None):
+        super().__init__(parent)
+        self.db = db
+        self.batch_id = int(batch_id)
+        self.mailboxes = {
+            m.mailbox_id: m for m in mailboxes
+            if m.enabled and m.address and m.mailbox_id
+        }
+        self.mailbox_order = [m.mailbox_id for m in mailboxes
+                              if m.mailbox_id in self.mailboxes]
+        self._rng = rng or random.SystemRandom()
+        self._sleep = sleep_fn or time.sleep
+        self._now = now_fn or datetime.now
+        self._send = send_fn or mailer.send_mail
+        self._pause_requested = threading.Event()
+        self._cancel_requested = threading.Event()
+
+    def pause(self):
+        """当前 SMTP 调用结束后停止领取新任务。"""
+        self._pause_requested.set()
+
+    def stop(self):
+        self.pause()
+
+    def cancel(self):
+        self._cancel_requested.set()
+        self._pause_requested.set()
+
+    def _interruptible_wait(self, seconds: float) -> bool:
+        if seconds <= 0 or os.environ.get("NAILONG_SMOKE"):
+            return not self._pause_requested.is_set()
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._pause_requested.is_set() or self._cancel_requested.is_set():
+                return False
+            step = min(1.0, remaining)
+            self._sleep(step)
+            remaining -= step
+        return True
+
+    @staticmethod
+    def _parse_time(value: str) -> datetime | None:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _smtp_error_kind(exc: Exception) -> str:
+        import smtplib
+        import socket
+        import ssl
+        text = str(exc).casefold()
+        mailbox_words = (
+            "auth", "535", "quota", "rate limit", "too many", "frequency",
+            "daily limit", "sender", "login", "connection refused",
+        )
+        recipient_words = (
+            "recipient", "mailbox unavailable", "user unknown", "no such user",
+            "invalid address", "bad address",
+        )
+        if isinstance(exc, smtplib.SMTPRecipientsRefused):
+            return "recipient"
+        if any(word in text for word in recipient_words):
+            return "recipient"
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            return "mailbox"
+        if any(word in text for word in mailbox_words):
+            return "mailbox"
+        if isinstance(exc, (TimeoutError, socket.timeout, socket.gaierror,
+                            ConnectionError, smtplib.SMTPServerDisconnected,
+                            ssl.SSLError)):
+            return "temporary"
+        if isinstance(exc, smtplib.SMTPResponseException):
+            if 400 <= exc.smtp_code < 500:
+                return "temporary"
+            if exc.smtp_code in (550, 551, 552, 553):
+                return "recipient"
+        return "recipient"
+
+    def _attempt(self, mailbox: MailboxConfig, submission):
+        limit = mailbox.daily_limit if mailbox.limit_enabled else None
+        if not self.db.reserve_daily_send(
+                submission.id, mailbox.address, limit, mailbox.mailbox_id):
+            return "limit", "已达到本地每日保护上限或任务状态已变化"
+        self.db.mark_submission_attempt(submission.id)
+        submission.attempt_count += 1
+        kwargs = {"message_id": submission.message_id} if submission.message_id else {}
+        try:
+            self._send(mailbox, submission.to_email, submission.subject,
+                       submission.body, submission.attachment_path or None, **kwargs)
+            return "sent", ""
+        except Exception as exc:
+            kind = self._smtp_error_kind(exc)
+            return kind, str(exc)
+
+    def _next_tomorrow(self) -> datetime:
+        now = self._now()
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=1,
+                                                  microsecond=0)
+
+    def run(self):
+        submissions = self.db.list_batch_submissions(
+            self.batch_id, self.PENDING_STATUSES)
+        total = len(submissions)
+        if not submissions:
+            self.db.update_batch(self.batch_id, status="completed", pause_reason="")
+            self.batch_done.emit("completed")
+            self.all_done.emit()
+            return
+        if not self.mailboxes:
+            self.db.update_batch(
+                self.batch_id, status="waiting", pause_reason="没有可用发件邮箱")
+            self.batch_done.emit("waiting")
+            self.all_done.emit()
+            return
+
+        queues = {mid: deque() for mid in self.mailbox_order}
+        next_order = {mid: 0 for mid in self.mailbox_order}
+        disabled: set[str] = set()
+        for submission in submissions:
+            eligible = [mid for mid in submission.allowed_mailbox_ids
+                        if mid in self.mailboxes]
+            chosen = submission.assigned_mailbox_id
+            if chosen not in eligible:
+                if not eligible:
+                    self.db.mark_submission_waiting(
+                        submission.id, "等待用户处理", "允许的发件邮箱均不可用")
+                    continue
+                chosen = min(eligible, key=lambda mid: (len(queues[mid]),
+                                                        self.mailbox_order.index(mid)))
+                self.db.update_submission_assignment(
+                    submission.id, chosen, next_order[chosen], "待发")
+            queues[chosen].append(submission)
+            next_order[chosen] = max(next_order[chosen], submission.queue_order + 1)
+
+        persisted = self.db.batch_mailbox_states(self.batch_id)
+        due_at = {mid: self._now() for mid in self.mailbox_order}
+        for mid, state in persisted.items():
+            parsed = self._parse_time(state.get("next_send_at", ""))
+            if mid in due_at and parsed and parsed > due_at[mid]:
+                due_at[mid] = parsed
+        for mid, queue in queues.items():
+            if queue:
+                parsed = self._parse_time(queue[0].next_attempt_at)
+                if parsed and parsed > due_at[mid]:
+                    due_at[mid] = parsed
+
+        completed = 0
+
+        def reassign(items, failed_mid: str, waiting_status: str, reason: str,
+                     tomorrow: datetime | None = None):
+            nonlocal queues
+            for submission in items:
+                choices = [mid for mid in submission.allowed_mailbox_ids
+                           if mid in self.mailboxes and mid not in disabled
+                           and mid != failed_mid]
+                if choices:
+                    chosen = min(choices, key=lambda mid: (
+                        len(queues[mid]), self.mailbox_order.index(mid)))
+                    self.db.update_submission_assignment(
+                        submission.id, chosen, next_order[chosen], "待发")
+                    submission.assigned_mailbox_id = chosen
+                    submission.queue_order = next_order[chosen]
+                    next_order[chosen] += 1
+                    queues[chosen].append(submission)
+                else:
+                    next_text = tomorrow.strftime("%Y-%m-%d %H:%M:%S") if tomorrow else ""
+                    self.db.mark_submission_waiting(
+                        submission.id, waiting_status, reason, next_text)
+
+        self.db.update_batch(self.batch_id, status="running", pause_reason="")
+        with ThreadPoolExecutor(max_workers=max(1, len(self.mailboxes))) as pool:
+            inflight = {}
+            while (any(queues[mid] for mid in self.mailbox_order) or inflight):
+                stopping = (self._pause_requested.is_set()
+                            or self._cancel_requested.is_set())
+                now = self._now()
+                busy_mailboxes = {item[0] for item in inflight.values()}
+                if not stopping:
+                    ready = [mid for mid in self.mailbox_order
+                             if mid not in disabled and mid not in busy_mailboxes
+                             and queues[mid] and due_at[mid] <= now]
+                    for mid in ready:
+                        submission = queues[mid].popleft()
+                        mailbox = self.mailboxes[mid]
+                        self.progress.emit(
+                            completed, total,
+                            f"正在发送 {submission.to_email}（{mailbox.address}）")
+                        future = pool.submit(self._attempt, mailbox, submission)
+                        inflight[future] = (mid, mailbox, submission)
+
+                if not inflight:
+                    if stopping:
+                        break
+                    future_times = [due_at[mid] for mid in self.mailbox_order
+                                    if mid not in disabled and queues[mid]]
+                    if not future_times:
+                        break
+                    seconds = max(0.0, (min(future_times) - self._now()).total_seconds())
+                    if not self._interruptible_wait(min(seconds, 1.0)):
+                        break
+                    continue
+
+                done, _pending = wait_futures(
+                    tuple(inflight), timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    # 等待中的 SMTP 不占用其他邮箱；下一轮会重新检查哪些邮箱已到点。
+                    continue
+
+                for future in done:
+                    mid, mailbox, submission = inflight.pop(future)
+                    try:
+                        outcome, error = future.result()
+                    except Exception as exc:
+                        outcome, error = "mailbox", str(exc)
+
+                    smtp_attempted = outcome != "limit"
+                    if smtp_attempted:
+                        interval = int(self._rng.randint(60, 180))
+                        due_at[mid] = self._now() + timedelta(seconds=interval)
+                        next_text = due_at[mid].strftime("%Y-%m-%d %H:%M:%S")
+                        self.db.set_batch_mailbox_state(
+                            self.batch_id, mid, "waiting", next_text, error)
+
+                    if outcome == "sent":
+                        self.db.update_status(submission.id, "已发", error="")
+                        self.db.update_from_mailbox(
+                            submission.id, mailbox.address, mailbox.mailbox_id)
+                        completed += 1
+                        self.item_done.emit(
+                            submission.id, "已发", "", mailbox.address)
+                    elif outcome == "temporary" and submission.attempt_count < 2:
+                        # 仅保留一次受控重试；等待由调度器管理，不阻塞其他邮箱。
+                        retry_text = due_at[mid].strftime("%Y-%m-%d %H:%M:%S")
+                        self.db.mark_submission_waiting(
+                            submission.id, "重试等待", error, retry_text)
+                        submission.next_attempt_at = retry_text
+                        queues[mid].appendleft(submission)
+                    elif outcome == "paused":
+                        self.db.update_submission_assignment(
+                            submission.id, mid, submission.queue_order, "待发")
+                    elif outcome == "recipient":
+                        self.db.update_status(submission.id, "失败", error=error)
+                        self.db.update_from_mailbox(
+                            submission.id, mailbox.address, mailbox.mailbox_id)
+                        completed += 1
+                        self.item_done.emit(
+                            submission.id, "失败", error, mailbox.address)
+                    elif outcome == "limit":
+                        tomorrow = self._next_tomorrow()
+                        waiting = [submission, *list(queues[mid])]
+                        queues[mid].clear()
+                        reassign(waiting, mid, "等待限额", "本地每日保护上限已到", tomorrow)
+                        self.db.set_batch_mailbox_state(
+                            self.batch_id, mid, "daily_limit",
+                            tomorrow.strftime("%Y-%m-%d %H:%M:%S"), error)
+                    else:  # mailbox-level failure
+                        disabled.add(mid)
+                        waiting = [submission, *list(queues[mid])]
+                        queues[mid].clear()
+                        reassign(waiting, mid, "等待用户处理", error)
+                        self.db.set_batch_mailbox_state(
+                            self.batch_id, mid, "paused", "", error)
+                        self.mailbox_paused.emit(mid, error)
+
+                    self.progress.emit(completed, total,
+                                       f"已处理 {completed}/{total} 封")
+
+        if self._cancel_requested.is_set():
+            self.db.cancel_batch(self.batch_id)
+            final_state = "cancelled"
+        elif self._pause_requested.is_set():
+            self.db.update_batch(
+                self.batch_id, status="paused", pause_reason="用户暂停")
+            final_state = "paused"
+        else:
+            remaining = self.db.list_batch_submissions(
+                self.batch_id, self.PENDING_STATUSES + ("结果待确认",))
+            if any(s.status == "结果待确认" for s in remaining):
+                final_state = "paused"
+                reason = "存在发送结果待确认的邮件"
+            elif remaining:
+                final_state = "waiting"
+                reason = "部分任务等待限额恢复或邮箱处理"
+            else:
+                final_state = "completed"
+                reason = ""
+            self.db.update_batch(self.batch_id, status=final_state, pause_reason=reason)
+        self.batch_done.emit(final_state)
         self.all_done.emit()
 
 
@@ -429,7 +742,7 @@ class ImportManuscriptsWorker(QThread):
         self._stopped = True
 
     def run(self):
-        from .docx_reader import read_docx_text, read_txt, count_cjk_words
+        from .docx_reader import read_document_stats
         ok = failed = 0
         errors: list[str] = []
         total = len(self.paths)
@@ -439,12 +752,11 @@ class ImportManuscriptsWorker(QThread):
             name = os.path.basename(path)
             self.progress.emit(i, max(total, 1), name)
             try:
-                ext = os.path.splitext(path)[1].lower()
-                text = read_docx_text(path) if ext == ".docx" else read_txt(path)
+                stats = read_document_stats(path)
                 copied = _copy_to_files_dir(self.db.files_dir, path)
                 self.db.insert_manuscript(Manuscript(
                     title=os.path.splitext(name)[0], file_path=copied,
-                    word_count=count_cjk_words(text)))
+                    word_count=stats.word_count, word_count_source=stats.source))
                 ok += 1
             except Exception as exc:
                 _log.warning("导入文稿失败 %s", path, exc_info=True)

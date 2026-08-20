@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from .. import APP_VERSION
 from .. import license as lic
-from ..models import MailboxConfig
+from ..models import LetterTemplate, MailboxConfig
 from ..settings_store import PROVIDER_NAMES, provider_preset
 from ..theme import THEMES
 from ..workers import TestMailboxWorker, AiTestWorker, AiLetterTplWorker
@@ -30,6 +31,7 @@ class MailboxCard(QFrame):
         self.index = index
         self.page = parent_page
         self._worker: TestMailboxWorker | None = None
+        self.mailbox_id = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
@@ -93,10 +95,20 @@ class MailboxCard(QFrame):
         imap_wrap.setLayout(imap_row)
         form.addRow("IMAP", imap_wrap)
 
+        limit_row = QHBoxLayout()
+        self.limit_check = QCheckBox("启用本地每日保护")
+        self.limit_check.setToolTip("默认关闭。邮箱服务商自身额度和风控仍然有效。")
         self.limit_spin = QSpinBox()
-        self.limit_spin.setRange(1, 500)
+        self.limit_spin.setRange(1, 100000)
         self.limit_spin.setValue(20)
-        form.addRow("单日上限", self.limit_spin)
+        self.limit_spin.setSuffix(" 封")
+        self.limit_check.toggled.connect(self.limit_spin.setEnabled)
+        limit_row.addWidget(self.limit_check)
+        limit_row.addWidget(self.limit_spin)
+        limit_row.addStretch()
+        limit_wrap = QWidget()
+        limit_wrap.setLayout(limit_row)
+        form.addRow("发送保护", limit_wrap)
         layout.addLayout(form)
 
         bottom = QHBoxLayout()
@@ -125,7 +137,10 @@ class MailboxCard(QFrame):
         self._set_server_editable(provider == "自定义")
 
     def to_config(self) -> MailboxConfig:
+        if not self.mailbox_id:
+            self.mailbox_id = uuid.uuid4().hex
         return MailboxConfig(
+            mailbox_id=self.mailbox_id,
             enabled=self.enabled_check.isChecked(),
             provider=self.provider_combo.currentText(),
             address=self.address_edit.text().strip(),
@@ -136,10 +151,12 @@ class MailboxCard(QFrame):
             smtp_ssl=self.smtp_ssl_check.isChecked(),
             imap_host=self.imap_host_edit.text().strip(),
             imap_port=self.imap_port_spin.value(),
+            limit_enabled=self.limit_check.isChecked(),
             daily_limit=self.limit_spin.value(),
         )
 
     def load_config(self, cfg: MailboxConfig):
+        self.mailbox_id = cfg.mailbox_id
         self.enabled_check.setChecked(cfg.enabled)
         provider = cfg.provider if cfg.provider in PROVIDER_NAMES else "自定义"
         self.provider_combo.blockSignals(True)
@@ -163,6 +180,8 @@ class MailboxCard(QFrame):
         self.imap_host_edit.setText(imap_host)
         self.imap_port_spin.setValue(imap_port)
         self.limit_spin.setValue(cfg.daily_limit)
+        self.limit_check.setChecked(cfg.limit_enabled)
+        self.limit_spin.setEnabled(cfg.limit_enabled)
         self._set_server_editable(provider == "自定义")
 
     def _on_test(self):
@@ -345,6 +364,24 @@ class SettingsPage(QWidget):
         hint.setObjectName("hintText")
         hint.setWordWrap(True)
         vbox.addWidget(hint)
+        select_row = QHBoxLayout()
+        select_row.addWidget(QLabel("模板"))
+        self.template_combo = QComboBox()
+        self.template_combo.currentIndexChanged.connect(self._on_template_selected)
+        select_row.addWidget(self.template_combo, 1)
+        self.template_add_btn = QPushButton("新增")
+        self.template_add_btn.clicked.connect(self._on_add_template)
+        select_row.addWidget(self.template_add_btn)
+        copy_btn = QPushButton("复制")
+        copy_btn.clicked.connect(self._on_copy_template)
+        select_row.addWidget(copy_btn)
+        delete_btn = QPushButton("删除")
+        delete_btn.clicked.connect(self._on_delete_template)
+        select_row.addWidget(delete_btn)
+        vbox.addLayout(select_row)
+        self.template_name_edit = QLineEdit()
+        self.template_name_edit.setPlaceholderText("模板名称")
+        vbox.addWidget(self.template_name_edit)
         vbox.addWidget(QLabel("主题模板"))
         self.letter_subject_edit = QLineEdit()
         vbox.addWidget(self.letter_subject_edit)
@@ -357,17 +394,19 @@ class SettingsPage(QWidget):
             "同一模板发给不同编辑时，只替换客套话（如「冒昧来信」「期待审阅」），"
             "作品名、字数、分类和自定义 {变:A|B} 槽位按编辑轮换，降低正文完全相同被判垃圾邮件的概率。")
         vbox.addWidget(self.letter_vary_check)
-        self.letter_ai_vary_check = QCheckBox("发信时用 AI 微调文案（需先接入 API）")
-        self.letter_ai_vary_check.setToolTip(
-            "每封发送前让大模型改客套话，作品名和字数保持不变。未接入或调用失败时自动退回上方的规则微调（不使用AI）。")
-        vbox.addWidget(self.letter_ai_vary_check)
+        self.letter_ai_vary_check = QCheckBox()
+        self.letter_ai_vary_check.setVisible(False)  # 兼容旧自动化；逐封 AI 已停用
+        ai_note = QLabel("AI 模板改为在投稿批次开始前一次生成并审核，不会在逐封发送时调用。")
+        ai_note.setObjectName("hintText")
+        ai_note.setWordWrap(True)
+        vbox.addWidget(ai_note)
         btn_row = QHBoxLayout()
         ai_tpl_btn = QPushButton("AI 生成模板")
         ai_tpl_btn.setToolTip("按你填写的要求生成可复用的主题和正文模板，需先接入 API")
         ai_tpl_btn.clicked.connect(self._on_ai_generate_tpl)
         btn_row.addWidget(ai_tpl_btn)
-        reset_btn = QPushButton("恢复默认")
-        reset_btn.clicked.connect(self._on_reset_letter_tpl)
+        reset_btn = QPushButton("恢复 5 套默认模板")
+        reset_btn.clicked.connect(self._on_restore_templates)
         btn_row.addWidget(reset_btn)
         btn_row.addStretch()
         vbox.addLayout(btn_row)
@@ -377,6 +416,90 @@ class SettingsPage(QWidget):
     def _on_reset_letter_tpl(self):
         self.letter_subject_edit.setText(DEFAULT_SUBJECT_TPL)
         self.letter_body_edit.setPlainText(DEFAULT_BODY_TPL)
+
+    def _load_template_list(self, preferred_id=None):
+        templates = self.db.list_letter_templates()
+        current_id = preferred_id or getattr(self, "_current_template_id", None)
+        if not current_id:
+            try:
+                current_id = int(self.store.get("letter_current_template_id", "") or 0)
+            except ValueError:
+                current_id = None
+        self.template_combo.blockSignals(True)
+        self.template_combo.clear()
+        for template in templates:
+            origin = {"builtin": "默认", "legacy": "旧版"}.get(template.origin, "自建")
+            self.template_combo.addItem(f"{template.name}（{origin}）", template.id)
+        index = self.template_combo.findData(current_id)
+        self.template_combo.setCurrentIndex(index if index >= 0 else (0 if templates else -1))
+        self.template_combo.blockSignals(False)
+        self._show_template(self.template_combo.currentData())
+
+    def _show_template(self, template_id):
+        template = self.db.get_letter_template(int(template_id)) if template_id else None
+        self._current_template_id = template.id if template else None
+        if template:
+            self.store.set("letter_current_template_id", str(template.id))
+        name = template.name if template else ""
+        subject = template.subject if template else ""
+        body = template.body if template else ""
+        if self.template_name_edit.text() != name:
+            self.template_name_edit.setText(name)
+        if self.letter_subject_edit.text() != subject:
+            self.letter_subject_edit.setText(subject)
+        if self.letter_body_edit.toPlainText() != body:
+            self.letter_body_edit.setPlainText(body)
+
+    def _save_current_template(self):
+        template_id = getattr(self, "_current_template_id", None)
+        if not template_id:
+            return
+        template = self.db.get_letter_template(template_id)
+        if template is None:
+            return
+        template.name = self.template_name_edit.text().strip() or "未命名模板"
+        template.subject = self.letter_subject_edit.text()
+        template.body = self.letter_body_edit.toPlainText()
+        self.db.update_letter_template(template)
+        index = self.template_combo.findData(template_id)
+        if index >= 0:
+            origin = {"builtin": "默认", "legacy": "旧版"}.get(template.origin, "自建")
+            self.template_combo.setItemText(index, f"{template.name}（{origin}）")
+
+    def _on_template_selected(self):
+        if getattr(self, "_loading", False):
+            return
+        self._save_current_template()
+        self._show_template(self.template_combo.currentData())
+
+    def _on_add_template(self):
+        template_id = self.db.insert_letter_template(LetterTemplate(
+            name="新模板", subject=DEFAULT_SUBJECT_TPL, body=DEFAULT_BODY_TPL))
+        self._load_template_list(template_id)
+
+    def _on_copy_template(self):
+        current = self.db.get_letter_template(getattr(self, "_current_template_id", 0))
+        if current is None:
+            self._on_add_template()
+            return
+        self._save_current_template()
+        template_id = self.db.insert_letter_template(LetterTemplate(
+            name=current.name + " 副本", subject=self.letter_subject_edit.text(),
+            body=self.letter_body_edit.toPlainText()))
+        self._load_template_list(template_id)
+
+    def _on_delete_template(self):
+        template_id = getattr(self, "_current_template_id", None)
+        if not template_id:
+            return
+        if QMessageBox.question(self, "删除模板", "确定删除当前模板吗？") != QMessageBox.Yes:
+            return
+        self.db.delete_letter_template(template_id)
+        self._load_template_list()
+
+    def _on_restore_templates(self):
+        self.db.restore_builtin_letter_templates()
+        self._load_template_list()
 
     def _on_ai_generate_tpl(self):
         cfg = self.store.get_ai_config()
@@ -587,11 +710,13 @@ class SettingsPage(QWidget):
         vbox.addWidget(one_draft_hint)
         form = QFormLayout()
         form.setSpacing(10)
-        self.interval_spin = QSpinBox()
+        self.interval_spin = QSpinBox()  # 兼容旧自动化，不再展示或参与批次调度
         self.interval_spin.setRange(5, 600)
         self.interval_spin.setValue(45)
-        self.interval_spin.setSuffix(" 秒")
-        form.addRow("每封间隔", self.interval_spin)
+        interval_note = QLabel("批次内每个邮箱首封立即发送，之后每次 SMTP 尝试随机等待 1–3 分钟。")
+        interval_note.setObjectName("hintText")
+        interval_note.setWordWrap(True)
+        form.addRow("发送间隔", interval_note)
         self.urge_days_spin = QSpinBox()
         self.urge_days_spin.setRange(7, 180)
         self.urge_days_spin.setValue(30)
@@ -806,9 +931,17 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "导入完成", "已导入备份，请重启软件。")
 
     def _on_clear_data(self):
+        live_batch = self.db.get_live_batch()
+        if live_batch is not None:
+            QMessageBox.warning(
+                self, "暂不能清空",
+                f"投稿批次“{live_batch.name}”仍处于运行、定时、暂停或等待状态。"
+                "请先到投稿页取消该批次。")
+            return
         ret = QMessageBox.warning(
             self, "确认清空",
-            "将删除全部文稿、投稿记录与回信（保留编辑列表和设置），不可恢复。确定继续吗？",
+            "将删除全部文稿、投稿批次、投稿记录与回信（保留编辑列表、模板库和设置），"
+            "不可恢复。确定继续吗？",
             QMessageBox.Yes | QMessageBox.No)
         if ret != QMessageBox.Yes:
             return
@@ -865,6 +998,7 @@ class SettingsPage(QWidget):
             card.smtp_ssl_check.toggled,
             card.imap_host_edit.textEdited,
             card.imap_port_spin.valueChanged,
+            card.limit_check.toggled,
             card.limit_spin.valueChanged,
         ):
             signal.connect(self._schedule_auto_save)
@@ -875,6 +1009,7 @@ class SettingsPage(QWidget):
         for signal in (
             self.letter_subject_edit.textEdited,
             self.letter_body_edit.textChanged,
+            self.template_name_edit.textEdited,
             self.letter_vary_check.toggled,
             self.letter_ai_vary_check.toggled,
             self.ai_provider_combo.currentIndexChanged,
@@ -928,14 +1063,15 @@ class SettingsPage(QWidget):
         mailboxes = self.store.load_mailboxes()
         for card, cfg in zip(self.mailbox_cards, mailboxes):
             card.load_config(cfg)
-        # 投稿信模板（文本没变就不要 setPlainText，否则光标会跳回开头）
-        subject_tpl, body_tpl = self.store.get_letter_template()
-        if self.letter_subject_edit.text() != subject_tpl:
-            self.letter_subject_edit.setText(subject_tpl)
-        if self.letter_body_edit.toPlainText() != body_tpl:
-            self.letter_body_edit.setPlainText(body_tpl)
+        # 投稿信模板库
+        try:
+            selected_template_id = int(
+                self.store.get("letter_current_template_id", "") or 0) or None
+        except ValueError:
+            selected_template_id = getattr(self, "_current_template_id", None)
+        self._load_template_list(selected_template_id)
         self.letter_vary_check.setChecked(self.store.get_letter_vary())
-        self.letter_ai_vary_check.setChecked(self.store.get_letter_ai_vary())
+        self.letter_ai_vary_check.setChecked(False)
         ai_cfg = self.store.get_ai_config()
         self.ai_provider_combo.blockSignals(True)
         self.ai_provider_combo.setCurrentText(ai_cfg.provider or DEFAULT_PROVIDER)
@@ -948,9 +1084,9 @@ class SettingsPage(QWidget):
         self.ai_hint_label.setText(tip)
         self.ai_base_edit.setEnabled((ai_cfg.provider or DEFAULT_PROVIDER) == "自定义")
         # 策略
-        one_draft, interval, _daily = self.store.get_strategy()
-        self.one_draft_check.setChecked(one_draft)
-        self.interval_spin.setValue(interval)
+        policy = self.store.get_strategy()
+        self.one_draft_check.setChecked(policy.one_draft_protection)
+        self.interval_spin.setValue(policy.legacy_interval_seconds)
         self.urge_days_spin.setValue(self.store.get_urge_days())
         # 收信
         auto, fetch_interval, lookback = self.store.get_fetch_config()
@@ -969,10 +1105,12 @@ class SettingsPage(QWidget):
         for i, card in enumerate(self.mailbox_cards):
             self.store.save_mailbox(i, card.to_config())
         self.store.save_mailbox_count(len(self.mailbox_cards))
-        self.store.save_letter_template(self.letter_subject_edit.text(),
-                                        self.letter_body_edit.toPlainText())
+        self._save_current_template()
+        # 同步旧键以保持旧定时记录与旧版本回退可读。
+        self.store.set("letter_subject_tpl", self.letter_subject_edit.text())
+        self.store.set("letter_body_tpl", self.letter_body_edit.toPlainText())
         self.store.save_letter_vary(self.letter_vary_check.isChecked())
-        self.store.save_letter_ai_vary(self.letter_ai_vary_check.isChecked())
+        self.store.save_letter_ai_vary(False)
         self.store.save_ai_config(
             self.ai_provider_combo.currentText(),
             self.ai_base_edit.text(),

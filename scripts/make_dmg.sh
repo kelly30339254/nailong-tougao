@@ -4,6 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+python3 scripts/validate_release.py
 VER=$(python3 -c "from app import APP_VERSION; print(APP_VERSION)")
 APP="dist/奶龙投稿助手.app"
 if [ ! -d "$APP" ] && [ -d "dist/奶龙投稿助手/奶龙投稿助手.app" ]; then

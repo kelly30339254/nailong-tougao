@@ -120,15 +120,33 @@ def main(argv: list[str]) -> int:
         _die("用法：build_windows.py [exe|installer] [--no-bump]")
 
     sys.path.insert(0, str(ROOT))
+    from app.announcements import validate_release_announcement
     if no_bump:
         from app import APP_VERSION
         print(f"[INFO] version {APP_VERSION} (no bump)")
+        announcement_version = APP_VERSION
     else:
+        current_text = _APP_INIT.read_text(encoding="utf-8")
+        current_match = _APP_VERSION_RE.search(current_text)
+        if not current_match:
+            _die(f"{_APP_INIT} 里找不到 APP_VERSION")
+        announcement_version = next_version(current_match.group(2))
+        try:
+            validate_release_announcement(
+                announcement_version, ROOT / "app" / "data" / "announcements.json")
+        except ValueError as exc:
+            _die(f"发版公告校验失败：{exc}（版本文件尚未修改）")
         old, APP_VERSION = bump_app_version()
         print(f"[INFO] version {old} -> {APP_VERSION}")
         # 已写入文件；清掉缓存以免后续 import 仍是旧号
         sys.modules.pop("app", None)
         sys.modules.pop("app.__init__", None)
+
+    try:
+        validate_release_announcement(APP_VERSION, ROOT / "app" / "data" / "announcements.json")
+    except ValueError as exc:
+        _die(f"发版公告校验失败：{exc}")
+    print(f"[INFO] announcement v{APP_VERSION} OK")
 
     py = _python()
     spec = _spec()

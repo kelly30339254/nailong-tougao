@@ -15,7 +15,8 @@ _RANK_SYS = (
 DEFAULT_TPL_REQUIREMENTS = (
     "请写一封可复用的投稿信模板（不是发给某个编辑的定稿）。\n"
     "要求：\n"
-    "1. 主题和正文都必须保留这些占位符：{编辑称呼} {作品名} {字数} {分类}\n"
+    "1. 主题和正文合起来必须保留：{编辑称呼} {作品名} {字数}\n"
+    "   {分类} {读者分类} {情绪} {作品风格} {作品类型} 为可选事实占位符\n"
     "2. 语气恭敬、简短，适合群发给不同编辑\n"
     "3. 不要出现电话、地址、银行卡、承诺过稿\n"
     "4. 可以酌情加入 {变:措辞A|措辞B} 供规则微调（不使用AI）使用\n"
@@ -24,7 +25,7 @@ DEFAULT_TPL_REQUIREMENTS = (
 
 _TPL_SYS = (
     "你写网文投稿信模板，不是某一封定稿。"
-    "必须原样包含占位符：{编辑称呼} {作品名} {字数} {分类}。"
+    "主题和正文合起来必须原样包含占位符：{编辑称呼} {作品名} {字数}。"
     "不要写电话、地址、银行卡、承诺过稿。"
     "返回 JSON：{\"subject\":\"主题模板\",\"body\":\"正文模板\"}"
 )
@@ -35,6 +36,15 @@ _VARY_SYS = (
     "只改问候、自荐用语、祝颂语和少量连接词，语气保持恭敬。"
     "不要添加电话、地址、银行卡、承诺过稿等原文没有的内容。"
     "返回 JSON：{\"subject\":\"主题\",\"body\":\"正文\"}"
+)
+
+_BATCH_TEMPLATES_SYS = (
+    "你为一篇网文生成多套可审核、可轮换的投稿信模板。"
+    "每套的主题与正文合起来必须原样包含 {编辑称呼}、{作品名}、{字数}。"
+    "可以使用 {分类}、{读者分类}、{情绪}、{作品风格}、{作品类型}，不得改写这些事实。"
+    "只变化问候、自荐、衔接和祝颂，不要加入电话、地址、银行卡或过稿承诺。"
+    "返回 JSON：{\"items\":[{\"name\":\"名称\",\"subject\":\"主题模板\","
+    "\"body\":\"正文模板\"}]}。items 数量必须与用户要求一致。"
 )
 
 
@@ -245,10 +255,59 @@ def generate_letter_template(config: AiConfig, requirements: str,
     body = str(data.get("body") or "").strip()
     if not subject or not body:
         raise AiError("AI 未返回完整的主题和正文")
-    missing = [p for p in ("{编辑称呼}", "{作品名}") if p not in subject + body]
+    missing = [p for p in ("{编辑称呼}", "{作品名}", "{字数}")
+               if p not in subject + body]
     if missing:
         raise AiError("生成结果缺少占位符：" + "、".join(missing))
     return subject, body
+
+
+def generate_batch_letter_templates(config: AiConfig, metadata: dict, count: int = 5,
+                                    timeout: int = 70) -> list[dict]:
+    """一次调用生成当前批次候选；上传内容严格限于标题和结构化标签。"""
+    count = int(count)
+    if not 2 <= count <= 10:
+        raise ValueError("AI 候选数量必须为 2–10")
+    allowed_keys = (
+        "title", "word_count", "category", "genre_type", "reader_group",
+        "emotion", "style",
+    )
+    safe_metadata = {key: str(metadata.get(key, "")) for key in allowed_keys}
+    user = f"请生成 {count} 套。作品结构化信息：\n{json_dumps(safe_metadata)}"
+    text = chat(
+        config,
+        [{"role": "system", "content": _BATCH_TEMPLATES_SYS},
+         {"role": "user", "content": user}],
+        timeout=timeout, temperature=0.8, max_tokens=min(5000, 500 * count))
+    data = parse_json_object(text)
+    items = data.get("items")
+    if not isinstance(items, list) or len(items) != count:
+        raise AiError(f"AI 应返回 {count} 套候选，实际格式或数量不符")
+    from .letter import validate_letter_template
+    result: list[dict] = []
+    literal_facts = {
+        str(safe_metadata.get(key) or "").strip()
+        for key in ("title", "category", "genre_type", "reader_group", "emotion", "style")
+        if str(safe_metadata.get(key) or "").strip()
+    }
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise AiError(f"第 {index + 1} 套候选格式无效")
+        subject = str(item.get("subject") or "").strip()
+        body = str(item.get("body") or "").strip()
+        issues = validate_letter_template(subject, body)
+        if issues:
+            raise AiError(f"第 {index + 1} 套候选：{'；'.join(issues)}")
+        hardcoded = [fact for fact in literal_facts if fact in subject + body]
+        if hardcoded:
+            raise AiError(
+                f"第 {index + 1} 套候选把事实写死了，应改用占位符：{'、'.join(hardcoded)}")
+        result.append({
+            "name": str(item.get("name") or f"AI 候选 {index + 1}").strip(),
+            "subject": subject, "body": body, "selected": True,
+            "origin": "ai",
+        })
+    return result
 
 
 def json_dumps(obj) -> str:

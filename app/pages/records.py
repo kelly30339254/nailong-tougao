@@ -9,10 +9,13 @@ from PySide6.QtWidgets import (
     QLineEdit, QDialog, QPlainTextEdit, QDateTimeEdit,
 )
 
-from ..workers import SendWorker
+from ..workers import BatchSendCoordinator, SendWorker
 from ..widgets import mk_item, badge_cell, PagedTable, export_csv
 
-STATUS_FILTERS = ["全部状态", "待发", "已发", "发送中", "已跳过", "失败", "定时待发"]
+STATUS_FILTERS = [
+    "全部状态", "待发", "已发", "发送中", "已跳过", "失败", "定时待发",
+    "等待限额", "等待用户处理", "重试等待", "结果待确认", "已取消",
+]
 REPLY_FILTERS = ["全部", "未回复", "过稿", "退稿", "需修改"]
 
 _ORANGE = QColor("#E8590C")
@@ -21,6 +24,8 @@ _GRAY = QColor("#A0989E")
 _STATUS_KIND = {
     "待发": "pending", "已发": "sent", "发送中": "sending", "已跳过": "skip",
     "失败": "fail", "定时待发": "scheduled",
+    "等待限额": "pending", "等待用户处理": "pending", "重试等待": "pending",
+    "结果待确认": "fail", "已取消": "skip",
 }
 _VERDICT_KIND = {"过稿": "pass", "退稿": "reject", "需修改": "revise"}
 
@@ -150,9 +155,9 @@ class RecordsPage(QWidget):
         m = manuscripts.get(s.manuscript_id)
         e = editors.get(s.editor_id)
         values = [
-            m.title if m else "（文稿已删除）",
-            e.name if e else "（编辑已删除）",
-            e.platform if e else "",
+            s.manuscript_title_snapshot or (m.title if m else "（文稿已删除）"),
+            s.editor_name_snapshot or (e.name if e else "（编辑已删除）"),
+            s.editor_platform_snapshot or (e.platform if e else ""),
             s.from_mailbox or "",
             s.sent_at or "",
         ]
@@ -175,6 +180,8 @@ class RecordsPage(QWidget):
             status_tooltip = _humanize_send_error(s.last_error)
         elif s.status == "定时待发" and s.scheduled_at:
             status_tooltip = f"计划 {s.scheduled_at}"
+        elif s.status == "结果待确认":
+            status_tooltip = "程序中断时 SMTP 结果未知；请人工确认，系统不会自动重发。"
         table.setCellWidget(row, 5, badge_cell(
             status_text, _STATUS_KIND.get(s.status, "other"),
             tooltip=status_tooltip))
@@ -198,6 +205,17 @@ class RecordsPage(QWidget):
             resend_btn.setToolTip("使用当时发出的主题和正文，不再微调")
             resend_btn.clicked.connect(lambda _=False, sub=s: self._on_resend(sub))
             lay.addWidget(resend_btn)
+        if s.status == "结果待确认":
+            sent_btn = QPushButton("确认已发")
+            sent_btn.setObjectName("iconBtn")
+            sent_btn.clicked.connect(
+                lambda _=False, sid=s.id: self._resolve_uncertain(sid, True))
+            lay.addWidget(sent_btn)
+            retry_btn = QPushButton("确认未发")
+            retry_btn.setObjectName("iconBtn")
+            retry_btn.clicked.connect(
+                lambda _=False, sid=s.id: self._resolve_uncertain(sid, False))
+            lay.addWidget(retry_btn)
         if s.status == "定时待发":
             preview_btn = QPushButton("预览")
             preview_btn.setObjectName("iconBtn")
@@ -226,15 +244,28 @@ class RecordsPage(QWidget):
         table.setCellWidget(row, 7, wrap)
 
     def _on_cancel_scheduled(self, submission):
+        scope = "整个投稿批次" if submission.batch_id else "这条定时投递"
         ret = QMessageBox.question(
             self, "取消定时投递",
-            f"确定取消这条定时投递吗？\n发往：{submission.to_email}\n计划：{submission.scheduled_at}")
+            f"确定取消{scope}吗？\n发往：{submission.to_email}\n计划：{submission.scheduled_at}")
         if ret == QMessageBox.Yes:
-            self.db.delete_submission(submission.id)
+            if submission.batch_id:
+                self.db.cancel_batch(submission.batch_id)
+            else:
+                self.db.delete_submission(submission.id)
             self.main_window.data_changed.emit()
             self._reload()
 
     # ---------- 重发 ----------
+    def _resolve_uncertain(self, submission_id: int, sent: bool):
+        text = ("确认该邮件已经发出？" if sent else
+                "确认该邮件没有发出？确认后会恢复为待发，可再手动重发。")
+        if QMessageBox.question(self, "确认发送结果", text) != QMessageBox.Yes:
+            return
+        self.db.resolve_uncertain_submission(submission_id, sent)
+        self.main_window.data_changed.emit()
+        self._reload(reset_page=False)
+
     def _on_resend(self, submission):
         if self._resend_worker is not None and self._resend_worker.isRunning():
             return
@@ -243,7 +274,8 @@ class RecordsPage(QWidget):
             QMessageBox.warning(self, "提示", "还没有已启用的发信邮箱，请先到设置页配置。")
             self.main_window.navigate("settings")
             return
-        available = [m for m in mailboxes if self.db.count_today(m.address) < m.daily_limit]
+        available = [m for m in mailboxes if
+                     not m.limit_enabled or self.db.count_today(m.address) < m.daily_limit]
         if not available:
             QMessageBox.warning(self, "提示", "所有已启用邮箱今日投递已达上限，请明天再试。")
             return
@@ -294,9 +326,9 @@ class RecordsPage(QWidget):
             m = manuscripts.get(s.manuscript_id)
             e = editors.get(s.editor_id)
             rows.append([
-                m.title if m else "（文稿已删除）",
-                e.name if e else "（编辑已删除）",
-                e.platform if e else "",
+                s.manuscript_title_snapshot or (m.title if m else "（文稿已删除）"),
+                s.editor_name_snapshot or (e.name if e else "（编辑已删除）"),
+                s.editor_platform_snapshot or (e.platform if e else ""),
                 s.from_mailbox or "",
                 s.sent_at or "",
                 s.status,
@@ -323,27 +355,27 @@ class RecordsPage(QWidget):
             QMessageBox.warning(self, "提示", "还没有已启用的发信邮箱，请先到设置页配置。")
             self.main_window.navigate("settings")
             return
-        available = [m for m in mailboxes if self.db.count_today(m.address) < m.daily_limit]
-        if not available:
-            QMessageBox.warning(self, "提示", "所有已启用邮箱今日投递已达上限，请明天再试。")
-            return
-        jobs = []
+        available = mailboxes
+        prepared = []
         for submission in items:
-            attachment = None
+            attachment = submission.attachment_path or ""
             if submission.manuscript_id:
                 manuscript = self.db.get_manuscript(submission.manuscript_id)
-                if manuscript and manuscript.file_path:
+                if not attachment and manuscript and manuscript.file_path:
                     attachment = manuscript.file_path
-            jobs.append({
-                "submission_id": submission.id, "to": submission.to_email,
-                "subject": submission.subject, "body": submission.body,
-                "message_id": submission.message_id,
-                "attachment_path": attachment,
-            })
-            self.db.update_status(submission.id, "待发", sent_at="")
-        self._resend_worker = SendWorker(available, jobs, 0, self, db=self.db)
-        self._resend_worker.item_done.connect(self._on_resend_item_done)
-        self._resend_worker.all_done.connect(self._on_resend_all_done)
+            prepared.append((submission.id, attachment))
+        try:
+            batch_id = self.db.prepare_bulk_resend_batch(
+                prepared, [m.mailbox_id for m in available])
+        except Exception as exc:
+            QMessageBox.warning(self, "无法批量重发", str(exc))
+            return
+        self._resend_worker = BatchSendCoordinator(
+            self.db, batch_id, available, self)
+        self._resend_worker.item_done.connect(
+            lambda *_args: self._reload(reset_page=False))
+        self._resend_worker.batch_done.connect(
+            lambda _status: self._on_resend_all_done())
         self._resend_worker.start()
         self.main_window.data_changed.emit()
 
@@ -383,7 +415,10 @@ class RecordsPage(QWidget):
 
         def save_time():
             text = when.dateTime().toString("yyyy-MM-dd HH:mm") + ":00"
-            self.db.update_scheduled_at(submission.id, text)
+            if submission.batch_id:
+                self.db.reschedule_batch(submission.batch_id, text)
+            else:
+                self.db.update_scheduled_at(submission.id, text)
             dlg.accept()
             self._reload(reset_page=False)
 

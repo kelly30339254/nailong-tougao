@@ -133,7 +133,12 @@ check("坏占位符原样保留不炸",
 store.save_letter_template("【投稿】{作品名}-{分类}", "致{编辑称呼}：请看《{作品名}》。")
 settings_page.refresh()
 check("模板设置载入", settings_page.letter_subject_edit.text() == "【投稿】{作品名}-{分类}")
-submit_page.manuscript_combo.setCurrentIndex(0)  # 带出测试文稿
+submit_page.refresh()
+submit_page._on_new_batch()
+submit_page.library_add_combo.setCurrentIndex(
+    submit_page.library_add_combo.findData(mid))
+submit_page._on_add_batch_manuscript()
+submit_page.manuscript_combo.setCurrentIndex(0)  # 批次内带出测试文稿
 submit_page.subject_edit.setText("")
 submit_page.body_edit.setPlainText("")
 submit_page._on_build_letter()
@@ -180,22 +185,35 @@ check("清空业务表（保留编辑）", len(db.list_editors()) > 0
 # ---------- 功能 6：定时投稿 ----------
 # 重新造数据
 eid3 = db.insert_editor(Editor(name="编辑三", platform="平台C", email="ed3@x.com"))
-mid2 = db.insert_manuscript(Manuscript(title="定时文稿", word_count=5000, category="科幻"))
+attachment_path = os.path.join(_tmp, "定时文稿.txt")
+with open(attachment_path, "w", encoding="utf-8") as handle:
+    handle.write("定时文稿正文。")
+mid2 = db.insert_manuscript(Manuscript(
+    title="定时文稿", word_count=5000, category="科幻", file_path=attachment_path))
 submit_page.refresh()
-submit_page.manuscript_combo.setCurrentIndex(0)
-submit_page.subject_edit.setText("投稿《定时文稿》")
-submit_page.body_edit.setPlainText("正文")
-submit_page._checked_ids.update({eid3})
+submit_page._on_new_batch()
+submit_page.library_add_combo.setCurrentIndex(
+    submit_page.library_add_combo.findData(mid2))
+submit_page._on_add_batch_manuscript()
+mailbox_id = store.load_mailboxes()[0].mailbox_id
+submit_page.batch_mailbox_combo.set_checked_values([mailbox_id])
+submit_page.batch_template_combo.set_checked_values(
+    [str(db.list_letter_templates()[0].id)])
+submit_page._checked_ids = {eid3}
+submit_page._checked_order = [eid3]
+batch_id = submit_page._batch_id
 submit_page._on_schedule()
 sched = [s for s in db.list_submissions() if s.status == "定时待发"]
-check("定时待发插入", len(sched) == 1 and sched[0].scheduled_at != "")
-check("定时日志", "已加入定时队列 1 封" in submit_page.log_edit.toPlainText())
-check("未到点不触发", db.due_scheduled() == [])
+check("定时批次物化", len(sched) == 1 and sched[0].scheduled_at != ""
+      and db.get_batch(batch_id).status == "scheduled")
+check("定时日志", "批次已冻结 1 封" in submit_page.log_edit.toPlainText())
+check("未到点不触发", db.due_batches() == [])
 # 改为过去时间 → 到点
 db._conn.execute("UPDATE submissions SET scheduled_at='2020-01-01 00:00:00' WHERE id=?",
                  (sched[0].id,))
 db._conn.commit()
-check("到点可查", len(db.due_scheduled()) == 1)
+db.update_batch(batch_id, scheduled_at="2020-01-01 00:00:00")
+check("到点可查", len(db.due_batches()) == 1)
 
 # 调度器触发（假 mailer）
 import app.mailer as mailer_mod
@@ -225,11 +243,13 @@ sid4 = db.insert_submission(Submission(manuscript_id=mid2, editor_id=eid4,
                                        to_email="ed4@x.com", status="定时待发",
                                        scheduled_at="2020-01-01 00:00:00"))
 store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x",
-                                    daily_limit=1))  # 今日已发 1 封 → 超限
+                                    mailbox_id=mailbox_id, daily_limit=1,
+                                    limit_enabled=True))  # 主动开启保护，今日已发 1 封
 win._check_scheduled()
 check("无可用邮箱保持待发", win._sched_worker is None
       and [s for s in db.list_submissions() if s.id == sid4][0].status == "定时待发")
-store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x"))
+store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x",
+                                    mailbox_id=mailbox_id, limit_enabled=False))
 
 # 投递记录页：定时待发筛选与显示
 records_page.status_combo.setCurrentText("定时待发")

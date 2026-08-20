@@ -35,20 +35,24 @@ store.save_fetch_config(False, 30, 45)          # 关闭自动收信
 store.save_strategy(True, 5, 30)                # 一稿一投开、间隔 5 秒
 store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x",
                                     smtp_host="smtp.qq.com", imap_host="imap.qq.com"))
+store.save_mailbox(1, MailboxConfig(enabled=True, address="me2@qq.com", auth_code="x",
+                                    smtp_host="smtp.qq.com", imap_host="imap.qq.com"))
 store.save_author(AuthorInfo(real_name="作者甲", pen_name="奶龙", phone="138"))
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 qapp = QApplication.instance() or QApplication([])
 
 # 屏蔽模态框（offscreen 下 exec 会阻塞）
 warnings = []
+notices = []
 questions = []
 from app.pages import submit as submit_mod
 from app.pages import records as records_mod
 from app.pages import replies as replies_mod
 for mod in (submit_mod, records_mod, replies_mod):
     mod.QMessageBox.warning = staticmethod(lambda *a, **k: warnings.append(a[-1]))
-    mod.QMessageBox.information = staticmethod(lambda *a, **k: None)
+    mod.QMessageBox.information = staticmethod(lambda *a, **k: notices.append(a[-1]))
     mod.QMessageBox.question = staticmethod(lambda *a, **k: (questions.append(a[-1]), QMessageBox.Yes)[1])
 
 from app.main_window import MainWindow
@@ -59,22 +63,10 @@ replies_page = win._pages["replies"]
 check("8 页全部真实页面", all(type(win._pages[p]).__name__ != "PlaceholderPage"
                              for p in win._pages))
 
-# ---------- 投稿方案：校验分支 ----------
+# ---------- 投稿批次：校验与文稿库分支 ----------
 submit_page._on_start()
-check("校验：空表单提示", any("作品名称" in w for w in warnings))
-warnings.clear()
-
-# 无启用邮箱分支（临时禁用）
-store.save_mailbox(0, MailboxConfig(enabled=False))
-submit_page.title_edit.setText("测试文稿")
-submit_page.words_edit.setText("10000")
-submit_page.subject_edit.setText("投稿《测试文稿》10000字 悬疑")
-submit_page.body_edit.setPlainText("正文")
-submit_page._on_start()
-check("校验：无启用邮箱提示", any("邮箱" in w for w in warnings))
-warnings.clear()
-store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x",
-                                    smtp_host="smtp.qq.com", imap_host="imap.qq.com"))
+check("校验：未建批次提示", any("批次" in text for text in notices))
+notices.clear()
 
 # 造编辑：ed1(平台A,有pending) / ed2(平台A) / ed3(平台B) / ed4(小黑屋)
 eid1 = db.insert_editor(Editor(name="编辑一", platform="平台A", email="ed1@x.com"))
@@ -82,32 +74,47 @@ eid2 = db.insert_editor(Editor(name="编辑二", platform="平台A", email="ed2@
 eid3 = db.insert_editor(Editor(name="编辑三", platform="平台B", email="ed3@x.com"))
 eid4 = db.insert_editor(Editor(name="编辑四", platform="平台C", email="ed4@x.com",
                                blacklisted=True))
-mid = db.insert_manuscript(Manuscript(title="测试文稿", word_count=10000, category="悬疑"))
+attachment_path = os.path.join(_tmp, "测试文稿.txt")
+with open(attachment_path, "w", encoding="utf-8") as handle:
+    handle.write("测试文稿正文内容。")
+mid = db.insert_manuscript(Manuscript(
+    title="测试文稿", word_count=10000, category="悬疑", file_path=attachment_path))
 pending_sid = db.insert_submission(Submission(manuscript_id=mid, editor_id=eid1,
                                               to_email="ed1@x.com"))
 db.update_status(pending_sid, "已发")   # 已发且无回复 → 一稿一投 pending
 
 submit_page.refresh()
+submit_page._on_new_batch()
+submit_page.library_add_combo.setCurrentIndex(
+    submit_page.library_add_combo.findData(mid))
+submit_page._on_add_batch_manuscript()
 check("小黑屋不出现在列表", all(eid4 not in [submit_page.table.item(r, 0).data(32)
                                              for r in range(submit_page.table.rowCount())]
                                 for _ in [0]) and submit_page.table.rowCount() == 3)
 
-# 临时 docx 选择（patch 文件对话框）
-import docx
-docx_path = os.path.join(_tmp, "临时文稿.docx")
-d = docx.Document()
-d.add_paragraph("临时文稿正文内容用于统计字数。")
-d.save(docx_path)
-submit_mod.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (docx_path, ""))
-temp_index = submit_page.manuscript_combo.count() - 1
-submit_page._on_manuscript_changed(temp_index)
-check("临时 docx 填入标题字数", submit_page.title_edit.text() == "临时文稿"
-      and submit_page.words_edit.text().isdigit()
-      and submit_page._current_manuscript_id() is None)
-# 切回文稿库文稿
-submit_page.manuscript_combo.setCurrentIndex(0)
-check("选中文稿带出信息", submit_page._current_manuscript_id() == mid
+check("稿件仅从文稿库加入", submit_page.manuscript_combo.count() == 1
+      and submit_page.manuscript_combo.itemData(0) == mid)
+check("选中批次稿件带出信息", submit_page._current_manuscript_id() == mid
       and submit_page.title_edit.text() == "测试文稿")
+
+# 无启用邮箱分支（批次预检）
+mailbox_ids = [m.mailbox_id for m in store.load_mailboxes()[:2]]
+store.save_mailbox(0, MailboxConfig(enabled=False, mailbox_id=mailbox_ids[0]))
+store.save_mailbox(1, MailboxConfig(enabled=False, mailbox_id=mailbox_ids[1]))
+submit_page._reload_batch_selectors()
+submit_page._on_start()
+check("校验：无启用邮箱提示", any("邮箱" in text for text in warnings))
+warnings.clear()
+store.save_mailbox(0, MailboxConfig(
+    enabled=True, address="me@qq.com", auth_code="x", mailbox_id=mailbox_ids[0],
+    smtp_host="smtp.qq.com", imap_host="imap.qq.com"))
+store.save_mailbox(1, MailboxConfig(
+    enabled=True, address="me2@qq.com", auth_code="x", mailbox_id=mailbox_ids[1],
+    smtp_host="smtp.qq.com", imap_host="imap.qq.com"))
+submit_page._reload_batch_selectors()
+submit_page.batch_mailbox_combo.set_checked_values(mailbox_ids)
+template_id = db.list_letter_templates()[0].id
+submit_page.batch_template_combo.set_checked_values([str(template_id)])
 
 # 生成投稿信
 submit_page.subject_edit.setText("")
@@ -120,10 +127,10 @@ check("生成投稿信", submit_page.subject_edit.text() == "投稿《测试文�
 submit_page._on_build_letter()
 check("已有内容时弹覆盖确认", len(questions) == 1)
 
-# 未勾选编辑分支
+# 未勾选编辑分支（每篇独立配置）
 submit_page._checked_ids.clear()
 submit_page._on_start()
-check("校验：未勾选编辑提示", any("勾选" in w for w in warnings))
+check("校验：未勾选编辑提示", any("编辑" in text for text in warnings))
 warnings.clear()
 
 # ---------- 投稿方案：发信流程（假 mailer） ----------
@@ -133,14 +140,22 @@ orig_send = mailer_mod.send_mail
 def fake_send(mailbox, to, subject, body, attachment_path=None, message_id=None):
     send_calls.append((mailbox.address, to))
     if to == "ed3@x.com":
-        raise Exception("535 模拟失败")
+        raise Exception("invalid recipient 模拟失败")
 mailer_mod.send_mail = fake_send
 try:
-    submit_page._checked_ids.update({eid1, eid2, eid3})
+    submit_page._checked_ids = {eid1, eid2, eid3}
+    submit_page._checked_order = [eid1, eid2, eid3]
     submit_page._update_checked_label()
+    submit_page._save_active_batch(silent=True)
+    from app.batching import BatchPlanner
+    preflight = BatchPlanner(db, store).preflight(submit_page._batch_id)
+    check("预检准确统计一稿一投", preflight.total == 2
+          and preflight.manuscripts[0].skipped["一稿一投"] == 1)
+    check("两邮箱最短队列各分一封",
+          sorted(preflight.mailbox_counts.values()) == [1, 1])
     submit_page._on_start()
-    worker = submit_page._send_worker
-    check("SendWorker 已启动（按钮态）", worker is not None
+    worker = submit_page._batch_worker
+    check("批次协调器已启动（按钮态）", worker is not None
           and not submit_page.start_btn.isEnabled()
           and submit_page.stop_btn.isEnabled())
     while worker.isRunning():
@@ -153,10 +168,9 @@ finally:
     mailer_mod.send_mail = orig_send
 
 log_text = submit_page.log_edit.toPlainText()
-check("一稿一投跳过日志", "跳过（一稿一投保护）：编辑一" in log_text)
 check("只发 2 封（ed2/ed3）", len(send_calls) == 2
       and {c[1] for c in send_calls} == {"ed2@x.com", "ed3@x.com"})
-check("全部完成日志", "全部完成：成功 1 失败 1 跳过 1" in log_text)
+check("批次完成日志", "批次完成：成功 1，失败 1" in log_text)
 check("按钮态恢复", submit_page.start_btn.isEnabled()
       and not submit_page.stop_btn.isEnabled())
 
@@ -170,14 +184,13 @@ check("成功记录状态+发信邮箱", ok_sub.status == "已发" and ok_sub.se
 check("失败记录状态", fail_sub.status == "失败")
 check("count_today 只计已发", db.count_today("me@qq.com") == 1)  # pending 无发信邮箱，失败不计
 
-# 单日上限分支：把上限调成 1 → 全部超限
-store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x",
-                                    daily_limit=1))
-submit_page._checked_ids.update({eid2})
-submit_page._on_start()
-check("校验：今日已达上限提示", any("上限" in w for w in warnings))
-warnings.clear()
-store.save_mailbox(0, MailboxConfig(enabled=True, address="me@qq.com", auth_code="x"))
+# 旧额度值保留，但新版本保护开关默认关闭。
+store.save_mailbox(0, MailboxConfig(
+    enabled=True, address="me@qq.com", auth_code="x", mailbox_id=mailbox_ids[0],
+    daily_limit=1, limit_enabled=False))
+saved_mailbox = store.load_mailboxes()[0]
+check("本地额度默认不限制", saved_mailbox.daily_limit == 1
+      and saved_mailbox.limit_enabled is False)
 
 # ---------- 投递记录 ----------
 records_page.status_combo.setCurrentText("全部状态")
@@ -295,7 +308,9 @@ check("本地文字教程内容完整", all(section in tutorial_text for section
 tutorial_dialog.close()
 check("表格单元格带 tooltip", win._pages["editors"].table.item(0, 1).toolTip()
       == win._pages["editors"].table.item(0, 1).text())
-check("文稿下拉项带 tooltip", submit_page.manuscript_combo.count() >= 1)
+check("文稿库下拉项带 tooltip", submit_page.library_add_combo.count() >= 1
+      and submit_page.library_add_combo.itemData(0, Qt.ToolTipRole)
+      == submit_page.library_add_combo.itemText(0))
 
 # 显式释放 Qt 对象（tutorial 对话框/查看全文对话框/主窗口），
 # 避免解释器退出时析构顺序不定导致的 offscreen 原生崩溃

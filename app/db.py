@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
 from datetime import datetime, date, timedelta
 
-from .models import Editor, Manuscript, Submission, Reply, Sale
+from .models import (
+    BatchManuscript, Editor, LetterTemplate, Manuscript, Reply, Sale,
+    Submission, SubmissionBatch,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS editors (
@@ -36,6 +40,7 @@ CREATE TABLE IF NOT EXISTS manuscripts (
     emotion TEXT DEFAULT '',
     style TEXT DEFAULT '',
     genre_type TEXT DEFAULT '',
+    word_count_source TEXT DEFAULT '',
     created_at TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS submissions (
@@ -51,7 +56,19 @@ CREATE TABLE IF NOT EXISTS submissions (
     sent_at TEXT DEFAULT '',
     replied_at TEXT DEFAULT '',
     scheduled_at TEXT DEFAULT '',
-    message_id TEXT DEFAULT ''
+    message_id TEXT DEFAULT '',
+    batch_id INTEGER,
+    batch_manuscript_id INTEGER,
+    assigned_mailbox_id TEXT DEFAULT '',
+    queue_order INTEGER DEFAULT 0,
+    attachment_path TEXT DEFAULT '',
+    template_source TEXT DEFAULT '',
+    allowed_mailbox_ids TEXT DEFAULT '[]',
+    attempt_count INTEGER DEFAULT 0,
+    next_attempt_at TEXT DEFAULT '',
+    manuscript_title_snapshot TEXT DEFAULT '',
+    editor_name_snapshot TEXT DEFAULT '',
+    editor_platform_snapshot TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +93,52 @@ CREATE TABLE IF NOT EXISTS replies (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS letter_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    origin TEXT DEFAULT 'user',
+    created_at TEXT DEFAULT '',
+    updated_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS submission_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    status TEXT DEFAULT 'draft',
+    scheduled_at TEXT DEFAULT '',
+    random_seed TEXT DEFAULT '',
+    pause_reason TEXT DEFAULT '',
+    created_at TEXT DEFAULT '',
+    updated_at TEXT DEFAULT '',
+    started_at TEXT DEFAULT '',
+    finished_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS batch_manuscripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    manuscript_id INTEGER NOT NULL,
+    position INTEGER DEFAULT 0,
+    mailbox_ids TEXT DEFAULT '[]',
+    template_ids TEXT DEFAULT '[]',
+    ai_templates TEXT DEFAULT '[]',
+    UNIQUE(batch_id, manuscript_id)
+);
+CREATE TABLE IF NOT EXISTS batch_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_manuscript_id INTEGER NOT NULL,
+    editor_id INTEGER NOT NULL,
+    position INTEGER DEFAULT 0,
+    UNIQUE(batch_manuscript_id, editor_id)
+);
+CREATE TABLE IF NOT EXISTS batch_mailbox_state (
+    batch_id INTEGER NOT NULL,
+    mailbox_id TEXT NOT NULL,
+    state TEXT DEFAULT 'ready',
+    next_send_at TEXT DEFAULT '',
+    last_error TEXT DEFAULT '',
+    PRIMARY KEY(batch_id, mailbox_id)
 );
 """
 
@@ -139,6 +202,11 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_editors_email_key ON editors(email_key)")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_editors_origin ON editors(origin)")
+        manuscript_cols = {r["name"] for r in
+                           self._conn.execute("PRAGMA table_info(manuscripts)").fetchall()}
+        if "word_count_source" not in manuscript_cols:
+            self._conn.execute(
+                "ALTER TABLE manuscripts ADD COLUMN word_count_source TEXT DEFAULT ''")
         subs_cols = {r["name"] for r in
                      self._conn.execute("PRAGMA table_info(submissions)").fetchall()}
         if "scheduled_at" not in subs_cols:
@@ -153,6 +221,24 @@ class Database:
         if "last_urged_at" not in subs_cols:
             self._conn.execute(
                 "ALTER TABLE submissions ADD COLUMN last_urged_at TEXT DEFAULT ''")
+        submission_columns = (
+            ("batch_id", "INTEGER"),
+            ("batch_manuscript_id", "INTEGER"),
+            ("assigned_mailbox_id", "TEXT DEFAULT ''"),
+            ("queue_order", "INTEGER DEFAULT 0"),
+            ("attachment_path", "TEXT DEFAULT ''"),
+            ("template_source", "TEXT DEFAULT ''"),
+            ("allowed_mailbox_ids", "TEXT DEFAULT '[]'"),
+            ("attempt_count", "INTEGER DEFAULT 0"),
+            ("next_attempt_at", "TEXT DEFAULT ''"),
+            ("manuscript_title_snapshot", "TEXT DEFAULT ''"),
+            ("editor_name_snapshot", "TEXT DEFAULT ''"),
+            ("editor_platform_snapshot", "TEXT DEFAULT ''"),
+        )
+        for name, definition in submission_columns:
+            if name not in subs_cols:
+                self._conn.execute(
+                    f"ALTER TABLE submissions ADD COLUMN {name} {definition}")
         replies_cols = {r["name"] for r in
                         self._conn.execute("PRAGMA table_info(replies)").fetchall()}
         reply_columns = (
@@ -208,9 +294,54 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_subs_message_id ON submissions(message_id)")
         self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subs_batch_queue "
+            "ON submissions(batch_id, assigned_mailbox_id, queue_order)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_status ON submission_batches(status)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batch_targets_manuscript "
+            "ON batch_targets(batch_manuscript_id, position)")
+        self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_replies_submission ON replies(submission_id)")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_replies_dedupe ON replies(mailbox_address, imap_folder, message_id)")
+        self._seed_letter_templates()
+
+    def _seed_letter_templates(self):
+        """一次性导入旧模板并补齐五套内置模板，不覆盖用户内容。"""
+        marker = self._conn.execute(
+            "SELECT value FROM settings WHERE key='letter_templates_v2'").fetchone()
+        if marker:
+            return
+        from .letter import DEFAULT_TEMPLATE_SET
+        count = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM letter_templates").fetchone()["c"]
+        now = _now()
+        if count == 0:
+            subject_row = self._conn.execute(
+                "SELECT value FROM settings WHERE key='letter_subject_tpl'").fetchone()
+            body_row = self._conn.execute(
+                "SELECT value FROM settings WHERE key='letter_body_tpl'").fetchone()
+            legacy_subject = subject_row["value"] if subject_row else ""
+            legacy_body = body_row["value"] if body_row else ""
+            if legacy_subject or legacy_body:
+                from .letter import DEFAULT_BODY_TPL, DEFAULT_SUBJECT_TPL
+                self._conn.execute(
+                    "INSERT INTO letter_templates(name,subject,body,origin,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    ("旧版模板", legacy_subject or DEFAULT_SUBJECT_TPL,
+                     legacy_body or DEFAULT_BODY_TPL, "legacy", now, now))
+        existing_names = {r["name"] for r in self._conn.execute(
+            "SELECT name FROM letter_templates WHERE origin='builtin'").fetchall()}
+        for name, subject, body in DEFAULT_TEMPLATE_SET:
+            if name in existing_names:
+                continue
+            self._conn.execute(
+                "INSERT INTO letter_templates(name,subject,body,origin,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?)", (name, subject, body, "builtin", now, now))
+        self._conn.execute(
+            "INSERT INTO settings(key,value) VALUES('letter_templates_v2','1') "
+            "ON CONFLICT(key) DO UPDATE SET value='1'")
 
     @property
     def files_dir(self) -> str:
@@ -377,7 +508,8 @@ class Database:
 
     # ---------- editors ----------
     def list_editors(self, keyword: str | None = None, platform: str | None = None,
-                     genre: str | None = None, direction: str | None = None,
+                     genre: str | list[str] | None = None,
+                     direction: str | list[str] | None = None,
                      favorites_only: bool = False,
                      include_blacklisted: bool = False,
                      origin: str | None = None) -> list[Editor]:
@@ -404,10 +536,18 @@ class Database:
                        or kw in (e.platform or "").lower()]
         if platform:
             editors = [e for e in editors if e.platform == platform]
-        if genre:
-            editors = [e for e in editors if genre in (e.genres or "")]
-        if direction:
-            editors = [e for e in editors if direction in (e.directions or "")]
+        genres = [genre] if isinstance(genre, str) else list(genre or [])
+        directions = [direction] if isinstance(direction, str) else list(direction or [])
+        if genres:
+            wanted = {str(value).casefold() for value in genres}
+            editors = [e for e in editors
+                       if wanted.intersection(
+                           tag.casefold() for tag in self._split_tags(e.genres or ""))]
+        if directions:
+            wanted = {str(value).casefold() for value in directions}
+            editors = [e for e in editors
+                       if wanted.intersection(
+                           tag.casefold() for tag in self._split_tags(e.directions or ""))]
         return editors
 
     def list_user_editors(self, **kwargs) -> list[Editor]:
@@ -540,7 +680,7 @@ class Database:
     def _split_tags(text: str) -> list[str]:
         result: list[str] = []
         seen = set()
-        for part in (text or "").replace("，", "/").replace(",", "/").replace("、", "/").replace(" ", "/").split("/"):
+        for part in re.split(r"[/、，,;；|\s]+", text or ""):
             part = part.strip()
             if part and part not in seen:
                 seen.add(part)
@@ -590,6 +730,385 @@ class Database:
         from .builtin_pack import reveal_text
         return reveal_text(value or "").strip()
 
+    # ---------- letter templates ----------
+    @staticmethod
+    def _row_to_letter_template(r: sqlite3.Row) -> LetterTemplate:
+        return LetterTemplate(
+            id=r["id"], name=r["name"], subject=r["subject"], body=r["body"],
+            origin=r["origin"], created_at=r["created_at"], updated_at=r["updated_at"])
+
+    def list_letter_templates(self) -> list[LetterTemplate]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM letter_templates ORDER BY id").fetchall()
+        return [self._row_to_letter_template(r) for r in rows]
+
+    def get_letter_template(self, template_id: int) -> LetterTemplate | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM letter_templates WHERE id=?", (template_id,)).fetchone()
+        return self._row_to_letter_template(row) if row else None
+
+    def insert_letter_template(self, template: LetterTemplate) -> int:
+        now = _now()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO letter_templates(name,subject,body,origin,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (template.name.strip() or "未命名模板", template.subject,
+                 template.body, template.origin or "user",
+                 template.created_at or now, now))
+            return cur.lastrowid
+
+    def update_letter_template(self, template: LetterTemplate):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE letter_templates SET name=?,subject=?,body=?,updated_at=? WHERE id=?",
+                (template.name.strip() or "未命名模板", template.subject,
+                 template.body, _now(), template.id))
+
+    def delete_letter_template(self, template_id: int):
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM letter_templates WHERE id=?", (template_id,))
+
+    def restore_builtin_letter_templates(self):
+        """只恢复/补齐五套内置模板，不改旧版与用户模板。"""
+        from .letter import DEFAULT_TEMPLATE_SET
+        now = _now()
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT id FROM letter_templates WHERE origin='builtin' ORDER BY id").fetchall()
+            for index, (name, subject, body) in enumerate(DEFAULT_TEMPLATE_SET):
+                if index < len(rows):
+                    self._conn.execute(
+                        "UPDATE letter_templates SET name=?,subject=?,body=?,updated_at=? WHERE id=?",
+                        (name, subject, body, now, rows[index]["id"]))
+                else:
+                    self._conn.execute(
+                        "INSERT INTO letter_templates(name,subject,body,origin,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?)", (name, subject, body, "builtin", now, now))
+            if len(rows) > len(DEFAULT_TEMPLATE_SET):
+                extra_ids = [row["id"] for row in rows[len(DEFAULT_TEMPLATE_SET):]]
+                marks = ",".join("?" for _ in extra_ids)
+                self._conn.execute(
+                    f"DELETE FROM letter_templates WHERE id IN ({marks})", extra_ids)
+
+    # ---------- persistent submission batches ----------
+    @staticmethod
+    def _row_to_batch(r: sqlite3.Row) -> SubmissionBatch:
+        return SubmissionBatch(
+            id=r["id"], name=r["name"], status=r["status"],
+            scheduled_at=r["scheduled_at"], random_seed=r["random_seed"],
+            pause_reason=r["pause_reason"], created_at=r["created_at"],
+            updated_at=r["updated_at"], started_at=r["started_at"],
+            finished_at=r["finished_at"])
+
+    def create_batch(self, name: str = "") -> int:
+        now = _now()
+        if not name.strip():
+            name = "投稿批次 " + datetime.now().strftime("%m-%d %H:%M")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO submission_batches(name,status,random_seed,created_at,updated_at) "
+                "VALUES(?,'draft',?,?,?)",
+                (name.strip(), os.urandom(12).hex(), now, now))
+            return cur.lastrowid
+
+    def list_batches(self, include_finished: bool = True) -> list[SubmissionBatch]:
+        sql = "SELECT * FROM submission_batches"
+        if not include_finished:
+            sql += " WHERE status NOT IN ('completed','cancelled')"
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+        return [self._row_to_batch(r) for r in rows]
+
+    def get_batch(self, batch_id: int) -> SubmissionBatch | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM submission_batches WHERE id=?", (batch_id,)).fetchone()
+        return self._row_to_batch(row) if row else None
+
+    def get_live_batch(self, excluding_id: int | None = None) -> SubmissionBatch | None:
+        args: list = []
+        sql = ("SELECT * FROM submission_batches WHERE status IN "
+               "('scheduled','running','paused','waiting')")
+        if excluding_id is not None:
+            sql += " AND id!=?"
+            args.append(excluding_id)
+        sql += " ORDER BY id DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, args).fetchone()
+        return self._row_to_batch(row) if row else None
+
+    def update_batch(self, batch_id: int, *, name: str | None = None,
+                     status: str | None = None, scheduled_at: str | None = None,
+                     pause_reason: str | None = None):
+        fields = ["updated_at=?"]
+        args: list = [_now()]
+        for column, value in (("name", name), ("status", status),
+                              ("scheduled_at", scheduled_at),
+                              ("pause_reason", pause_reason)):
+            if value is not None:
+                fields.append(f"{column}=?")
+                args.append(value)
+        if status == "running":
+            fields.append("started_at=CASE WHEN started_at='' THEN ? ELSE started_at END")
+            args.append(_now())
+        if status in ("completed", "cancelled"):
+            fields.append("finished_at=?")
+            args.append(_now())
+        args.append(batch_id)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"UPDATE submission_batches SET {','.join(fields)} WHERE id=?", args)
+
+    def delete_batch(self, batch_id: int):
+        with self._lock, self._conn:
+            bm_rows = self._conn.execute(
+                "SELECT id FROM batch_manuscripts WHERE batch_id=?", (batch_id,)).fetchall()
+            bm_ids = [r["id"] for r in bm_rows]
+            if bm_ids:
+                marks = ",".join("?" for _ in bm_ids)
+                self._conn.execute(
+                    f"DELETE FROM batch_targets WHERE batch_manuscript_id IN ({marks})", bm_ids)
+            self._conn.execute("DELETE FROM batch_manuscripts WHERE batch_id=?", (batch_id,))
+            self._conn.execute("DELETE FROM batch_mailbox_state WHERE batch_id=?", (batch_id,))
+            self._conn.execute(
+                "DELETE FROM submissions WHERE batch_id=? AND status NOT IN ('已发','发送中')",
+                (batch_id,))
+            self._conn.execute("DELETE FROM submission_batches WHERE id=?", (batch_id,))
+
+    @staticmethod
+    def _safe_json_list(raw: str, cast=None) -> list:
+        try:
+            value = json.loads(raw or "[]")
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(value, list):
+            return []
+        if cast is None:
+            return value
+        result = []
+        for item in value:
+            try:
+                result.append(cast(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def save_batch_configuration(self, batch_id: int,
+                                 manuscripts: list[BatchManuscript]):
+        if len(manuscripts) > 10:
+            raise ValueError("每个投稿批次最多 10 篇稿件")
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            raise ValueError("投稿批次不存在")
+        if batch.status != "draft":
+            raise ValueError("只有草稿批次可以修改配置")
+        with self._lock, self._conn:
+            old = self._conn.execute(
+                "SELECT id FROM batch_manuscripts WHERE batch_id=?", (batch_id,)).fetchall()
+            old_ids = [r["id"] for r in old]
+            if old_ids:
+                marks = ",".join("?" for _ in old_ids)
+                self._conn.execute(
+                    f"DELETE FROM batch_targets WHERE batch_manuscript_id IN ({marks})", old_ids)
+            self._conn.execute("DELETE FROM batch_manuscripts WHERE batch_id=?", (batch_id,))
+            for position, item in enumerate(manuscripts):
+                cur = self._conn.execute(
+                    "INSERT INTO batch_manuscripts(batch_id,manuscript_id,position,mailbox_ids,"
+                    "template_ids,ai_templates) VALUES(?,?,?,?,?,?)",
+                    (batch_id, item.manuscript_id, position,
+                     json.dumps(list(dict.fromkeys(item.mailbox_ids)), ensure_ascii=False),
+                     json.dumps(list(dict.fromkeys(item.template_ids)), ensure_ascii=False),
+                     json.dumps(item.ai_templates or [], ensure_ascii=False)))
+                bm_id = cur.lastrowid
+                for target_pos, editor_id in enumerate(dict.fromkeys(item.target_editor_ids)):
+                    self._conn.execute(
+                        "INSERT INTO batch_targets(batch_manuscript_id,editor_id,position) "
+                        "VALUES(?,?,?)", (bm_id, int(editor_id), target_pos))
+            self._conn.execute(
+                "UPDATE submission_batches SET updated_at=? WHERE id=?", (_now(), batch_id))
+
+    def list_batch_manuscripts(self, batch_id: int) -> list[BatchManuscript]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM batch_manuscripts WHERE batch_id=? ORDER BY position,id",
+                (batch_id,)).fetchall()
+            target_rows = self._conn.execute(
+                "SELECT t.batch_manuscript_id,t.editor_id FROM batch_targets t "
+                "JOIN batch_manuscripts bm ON bm.id=t.batch_manuscript_id "
+                "WHERE bm.batch_id=? ORDER BY t.batch_manuscript_id,t.position,t.id",
+                (batch_id,)).fetchall()
+        targets: dict[int, list[int]] = {}
+        for target in target_rows:
+            targets.setdefault(target["batch_manuscript_id"], []).append(target["editor_id"])
+        return [BatchManuscript(
+            id=r["id"], batch_id=r["batch_id"], manuscript_id=r["manuscript_id"],
+            position=r["position"],
+            mailbox_ids=self._safe_json_list(r["mailbox_ids"], str),
+            template_ids=self._safe_json_list(r["template_ids"], int),
+            ai_templates=self._safe_json_list(r["ai_templates"]),
+            target_editor_ids=targets.get(r["id"], []),
+        ) for r in rows]
+
+    def materialize_batch_submissions(self, batch_id: int,
+                                      items: list[tuple[Submission, bool]]) -> list[int | None]:
+        """在同一事务中建立批次投稿；返回与 items 对齐的记录 id/None。"""
+        batch = self.get_batch(batch_id)
+        if batch is None or batch.status != "draft":
+            raise ValueError("只有草稿批次可以开始或定时")
+        live = self.get_live_batch(excluding_id=batch_id)
+        if live is not None:
+            raise ValueError(f"已有活动批次“{live.name}”，请先完成或取消")
+        ids: list[int | None] = []
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM submissions WHERE batch_id=? AND status NOT IN ('已发','发送中')",
+                (batch_id,))
+            for submission, protect in items:
+                if protect:
+                    exists = self._conn.execute(
+                        "SELECT 1 FROM submissions WHERE manuscript_id=? AND editor_id=? "
+                        "AND (status IN ('待发','定时待发','发送中','等待限额','结果待确认',"
+                        "'等待用户处理','重试等待') "
+                        "OR (status='已发' AND reply_status='无')) LIMIT 1",
+                        (submission.manuscript_id, submission.editor_id)).fetchone()
+                    if exists:
+                        ids.append(None)
+                        continue
+                cur = self._conn.execute(
+                    "INSERT INTO submissions(manuscript_id,editor_id,from_mailbox,to_email,subject,"
+                    "body,status,reply_status,sent_at,replied_at,scheduled_at,message_id,last_error,"
+                    "batch_id,batch_manuscript_id,assigned_mailbox_id,queue_order,attachment_path,"
+                    "template_source,allowed_mailbox_ids,attempt_count,next_attempt_at,"
+                    "manuscript_title_snapshot,editor_name_snapshot,editor_platform_snapshot) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (submission.manuscript_id, submission.editor_id, submission.from_mailbox,
+                     submission.to_email, submission.subject, submission.body, submission.status,
+                     submission.reply_status, submission.sent_at, submission.replied_at,
+                     submission.scheduled_at, submission.message_id, submission.last_error,
+                     batch_id, submission.batch_manuscript_id,
+                     submission.assigned_mailbox_id, submission.queue_order,
+                     submission.attachment_path, submission.template_source,
+                     json.dumps(submission.allowed_mailbox_ids, ensure_ascii=False),
+                     submission.attempt_count, submission.next_attempt_at,
+                     submission.manuscript_title_snapshot,
+                     submission.editor_name_snapshot,
+                     submission.editor_platform_snapshot))
+                ids.append(cur.lastrowid)
+        return ids
+
+    def list_batch_submissions(self, batch_id: int,
+                               statuses: tuple[str, ...] | None = None) -> list[Submission]:
+        sql = "SELECT * FROM submissions WHERE batch_id=?"
+        args: list = [batch_id]
+        if statuses:
+            marks = ",".join("?" for _ in statuses)
+            sql += f" AND status IN ({marks})"
+            args.extend(statuses)
+        sql += " ORDER BY queue_order,id"
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [self._row_to_submission(r) for r in rows]
+
+    def due_batches(self, now_str: str | None = None) -> list[SubmissionBatch]:
+        now_str = now_str or _now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM submission_batches WHERE status='scheduled' "
+                "AND scheduled_at!='' AND scheduled_at<=? ORDER BY scheduled_at,id",
+                (now_str,)).fetchall()
+        return [self._row_to_batch(r) for r in rows]
+
+    def due_limit_batches(self, now_str: str | None = None) -> list[SubmissionBatch]:
+        """本地每日保护跨日后可自动继续的等待批次。"""
+        now_str = now_str or _now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT b.* FROM submission_batches b "
+                "JOIN batch_mailbox_state s ON s.batch_id=b.id "
+                "WHERE b.status='waiting' AND s.state='daily_limit' "
+                "AND s.next_send_at!='' AND s.next_send_at<=? ORDER BY b.id",
+                (now_str,)).fetchall()
+        return [self._row_to_batch(r) for r in rows]
+
+    def set_batch_mailbox_state(self, batch_id: int, mailbox_id: str,
+                                state: str, next_send_at: str = "",
+                                last_error: str = ""):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO batch_mailbox_state(batch_id,mailbox_id,state,next_send_at,last_error) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(batch_id,mailbox_id) DO UPDATE SET "
+                "state=excluded.state,next_send_at=excluded.next_send_at,last_error=excluded.last_error",
+                (batch_id, mailbox_id, state, next_send_at, last_error))
+
+    def batch_mailbox_states(self, batch_id: int) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM batch_mailbox_state WHERE batch_id=?", (batch_id,)).fetchall()
+        return {r["mailbox_id"]: dict(r) for r in rows}
+
+    def cancel_batch(self, batch_id: int):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET status='已取消',last_error='用户取消批次' "
+                "WHERE batch_id=? AND status IN ('待发','定时待发','等待限额',"
+                "'等待用户处理','重试等待')", (batch_id,))
+            self._conn.execute(
+                "UPDATE submission_batches SET status='cancelled',pause_reason='',"
+                "finished_at=?,updated_at=? WHERE id=?", (_now(), _now(), batch_id))
+
+    def reschedule_batch(self, batch_id: int, scheduled_at: str):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submission_batches SET scheduled_at=?,updated_at=? "
+                "WHERE id=? AND status='scheduled'", (scheduled_at, _now(), batch_id))
+            self._conn.execute(
+                "UPDATE submissions SET scheduled_at=? WHERE batch_id=? "
+                "AND status='定时待发'", (scheduled_at, batch_id))
+
+    def resolve_uncertain_submission(self, submission_id: int, sent: bool):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET status=?,last_error=?,sent_at=CASE WHEN ? THEN "
+                "COALESCE(NULLIF(sent_at,''),?) ELSE '' END WHERE id=? AND status='结果待确认'",
+                ("已发" if sent else "待发", "" if sent else "用户选择重新发送",
+                 int(sent), _now(), submission_id))
+
+    def prepare_bulk_resend_batch(self, submissions: list[tuple[int, str]],
+                                  mailbox_ids: list[str]) -> int:
+        """把选中的旧记录组成新的并行重发批次，正文/主题保持原快照。"""
+        mailbox_ids = list(dict.fromkeys(mid for mid in mailbox_ids if mid))
+        if not submissions or not mailbox_ids:
+            raise ValueError("批量重发需要记录和可用邮箱")
+        live = self.get_live_batch()
+        if live is not None:
+            raise ValueError(f"已有活动批次“{live.name}”，请先完成或取消")
+        now = _now()
+        counts = {mid: 0 for mid in mailbox_ids}
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO submission_batches(name,status,random_seed,created_at,updated_at,"
+                "started_at) VALUES(?,'running',?,?,?,?)",
+                ("投递记录批量重发 " + datetime.now().strftime("%m-%d %H:%M"),
+                 os.urandom(12).hex(), now, now, now))
+            batch_id = cur.lastrowid
+            for submission_id, attachment_path in submissions:
+                mailbox_id = min(mailbox_ids,
+                                 key=lambda mid: (counts[mid], mailbox_ids.index(mid)))
+                queue_order = counts[mailbox_id]
+                counts[mailbox_id] += 1
+                self._conn.execute(
+                    "UPDATE submissions SET batch_id=?,assigned_mailbox_id=?,"
+                    "allowed_mailbox_ids=?,queue_order=?,attachment_path=?,status='待发',"
+                    "sent_at='',last_error='',next_attempt_at='' WHERE id=?",
+                    (batch_id, mailbox_id,
+                     json.dumps(mailbox_ids, ensure_ascii=False), queue_order,
+                     attachment_path or "", submission_id))
+        return batch_id
+
     # ---------- manuscripts ----------
     @staticmethod
     def _row_to_manuscript(r: sqlite3.Row) -> Manuscript:
@@ -597,6 +1116,8 @@ class Database:
                           word_count=r["word_count"], category=r["category"],
                           reader_group=r["reader_group"], emotion=r["emotion"],
                           style=r["style"], genre_type=r["genre_type"],
+                          word_count_source=(r["word_count_source"]
+                                             if "word_count_source" in r.keys() else ""),
                           created_at=r["created_at"])
 
     def list_manuscripts(self) -> list[Manuscript]:
@@ -612,22 +1133,34 @@ class Database:
     def insert_manuscript(self, m: Manuscript) -> int:
         with self._lock, self._conn:
             cur = self._conn.execute(
-                "INSERT INTO manuscripts(title,file_path,word_count,category,reader_group,emotion,style,genre_type,created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO manuscripts(title,file_path,word_count,category,reader_group,emotion,style,"
+                "genre_type,word_count_source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (m.title, m.file_path, m.word_count, m.category, m.reader_group,
-                 m.emotion, m.style, m.genre_type, m.created_at or _now()))
+                 m.emotion, m.style, m.genre_type, m.word_count_source,
+                 m.created_at or _now()))
             return cur.lastrowid
 
     def update_manuscript(self, m: Manuscript):
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE manuscripts SET title=?,file_path=?,word_count=?,category=?,reader_group=?,"
-                "emotion=?,style=?,genre_type=? WHERE id=?",
+                "emotion=?,style=?,genre_type=?,word_count_source=? WHERE id=?",
                 (m.title, m.file_path, m.word_count, m.category, m.reader_group,
-                 m.emotion, m.style, m.genre_type, m.id))
+                 m.emotion, m.style, m.genre_type, m.word_count_source, m.id))
 
     def delete_manuscript(self, manuscript_id: int):
         with self._lock, self._conn:
+            batch_rows = self._conn.execute(
+                "SELECT id FROM batch_manuscripts WHERE manuscript_id=?",
+                (manuscript_id,)).fetchall()
+            batch_item_ids = [r["id"] for r in batch_rows]
+            if batch_item_ids:
+                marks = ",".join("?" for _ in batch_item_ids)
+                self._conn.execute(
+                    f"DELETE FROM batch_targets WHERE batch_manuscript_id IN ({marks})",
+                    batch_item_ids)
+                self._conn.execute(
+                    f"DELETE FROM batch_manuscripts WHERE id IN ({marks})", batch_item_ids)
             self._conn.execute("DELETE FROM manuscripts WHERE id=?", (manuscript_id,))
             # 连带删除其售出记录与关联投递/回信，避免幽灵数据污染统计
             self._conn.execute("DELETE FROM sales WHERE manuscript_id=?", (manuscript_id,))
@@ -703,58 +1236,109 @@ class Database:
                           reply_status=r["reply_status"], sent_at=r["sent_at"],
                           replied_at=r["replied_at"], scheduled_at=r["scheduled_at"],
                           message_id=r["message_id"],
-                          last_error=r["last_error"] if "last_error" in r.keys() else "")
+                          last_error=r["last_error"] if "last_error" in r.keys() else "",
+                          batch_id=r["batch_id"] if "batch_id" in r.keys() else None,
+                          batch_manuscript_id=(r["batch_manuscript_id"]
+                                               if "batch_manuscript_id" in r.keys() else None),
+                          assigned_mailbox_id=(r["assigned_mailbox_id"]
+                                               if "assigned_mailbox_id" in r.keys() else ""),
+                          queue_order=r["queue_order"] if "queue_order" in r.keys() else 0,
+                          attachment_path=(r["attachment_path"]
+                                           if "attachment_path" in r.keys() else ""),
+                          template_source=(r["template_source"]
+                                           if "template_source" in r.keys() else ""),
+                          allowed_mailbox_ids=(Database._safe_json_list(
+                              r["allowed_mailbox_ids"], str)
+                                               if "allowed_mailbox_ids" in r.keys() else []),
+                          attempt_count=(r["attempt_count"]
+                                         if "attempt_count" in r.keys() else 0),
+                          next_attempt_at=(r["next_attempt_at"]
+                                           if "next_attempt_at" in r.keys() else ""),
+                          manuscript_title_snapshot=(r["manuscript_title_snapshot"]
+                              if "manuscript_title_snapshot" in r.keys() else ""),
+                          editor_name_snapshot=(r["editor_name_snapshot"]
+                              if "editor_name_snapshot" in r.keys() else ""),
+                          editor_platform_snapshot=(r["editor_platform_snapshot"]
+                              if "editor_platform_snapshot" in r.keys() else ""))
 
     def insert_submission(self, s: Submission) -> int:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO submissions(manuscript_id,editor_id,from_mailbox,to_email,subject,body,"
-                "status,reply_status,sent_at,replied_at,scheduled_at,message_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status,reply_status,sent_at,replied_at,scheduled_at,message_id,batch_id,"
+                "batch_manuscript_id,assigned_mailbox_id,queue_order,attachment_path,template_source,"
+                "allowed_mailbox_ids,attempt_count,next_attempt_at,manuscript_title_snapshot,"
+                "editor_name_snapshot,editor_platform_snapshot) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (s.manuscript_id, s.editor_id, s.from_mailbox, s.to_email, s.subject, s.body,
                  s.status, s.reply_status, s.sent_at, s.replied_at, s.scheduled_at,
-                 s.message_id))
+                 s.message_id, s.batch_id, s.batch_manuscript_id,
+                 s.assigned_mailbox_id, s.queue_order, s.attachment_path,
+                 s.template_source, json.dumps(s.allowed_mailbox_ids, ensure_ascii=False),
+                 s.attempt_count, s.next_attempt_at, s.manuscript_title_snapshot,
+                 s.editor_name_snapshot, s.editor_platform_snapshot))
             return cur.lastrowid
 
     def insert_submission_if_allowed(self, s: Submission,
                                      protect: bool = True) -> int | None:
         """原子创建投稿；开启一稿一投时，存在活动记录则返回 None。"""
         columns = ("manuscript_id,editor_id,from_mailbox,to_email,subject,body,"
-                   "status,reply_status,sent_at,replied_at,scheduled_at,message_id")
+                   "status,reply_status,sent_at,replied_at,scheduled_at,message_id,"
+                   "batch_id,batch_manuscript_id,assigned_mailbox_id,queue_order,"
+                   "attachment_path,template_source,allowed_mailbox_ids,attempt_count,"
+                   "next_attempt_at,manuscript_title_snapshot,editor_name_snapshot,"
+                   "editor_platform_snapshot")
         values = (s.manuscript_id, s.editor_id, s.from_mailbox, s.to_email,
                   s.subject, s.body, s.status, s.reply_status, s.sent_at,
-                  s.replied_at, s.scheduled_at, s.message_id)
+                  s.replied_at, s.scheduled_at, s.message_id, s.batch_id,
+                  s.batch_manuscript_id, s.assigned_mailbox_id, s.queue_order,
+                  s.attachment_path, s.template_source,
+                  json.dumps(s.allowed_mailbox_ids, ensure_ascii=False),
+                  s.attempt_count, s.next_attempt_at, s.manuscript_title_snapshot,
+                  s.editor_name_snapshot, s.editor_platform_snapshot)
         with self._lock, self._conn:
+            marks = ",".join("?" for _ in values)
             if not protect:
-                marks = ",".join("?" for _ in values)
                 cur = self._conn.execute(
                     f"INSERT INTO submissions({columns}) VALUES({marks})", values)
                 return cur.lastrowid
             cur = self._conn.execute(
                 f"INSERT INTO submissions({columns}) "
-                "SELECT ?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS ("
+                f"SELECT {marks} WHERE NOT EXISTS ("
                 "SELECT 1 FROM submissions WHERE manuscript_id=? AND editor_id=?"
-                " AND (status IN ('待发','定时待发','发送中')"
+                " AND (status IN ('待发','定时待发','发送中','等待限额','结果待确认',"
+                "'等待用户处理','重试等待')"
                 " OR (status='已发' AND reply_status='无')))",
                 values + (s.manuscript_id, s.editor_id))
             return cur.lastrowid if cur.rowcount == 1 else None
 
     def reserve_daily_send(self, submission_id: int, mailbox_address: str,
-                           daily_limit: int) -> bool:
+                           daily_limit: int | None,
+                           mailbox_id: str = "") -> bool:
         """逐封原子预留邮箱当日额度，并把任务置为发送中。"""
-        if daily_limit <= 0 or not mailbox_address:
+        if not mailbox_address:
             return False
         today = date.today().strftime("%Y-%m-%d") + "%"
         now = _now()
         with self._lock, self._conn:
+            if daily_limit is None or int(daily_limit) <= 0:
+                cur = self._conn.execute(
+                    "UPDATE submissions SET from_mailbox=?,assigned_mailbox_id=?,"
+                    "status='发送中',sent_at=? WHERE id=? "
+                    "AND status IN ('待发','定时待发','等待限额','等待用户处理',"
+                    "'重试等待')",
+                    (mailbox_address, mailbox_id, now, submission_id))
+                return cur.rowcount == 1
             cur = self._conn.execute(
-                "UPDATE submissions SET from_mailbox=?,status='发送中',sent_at=?"
-                " WHERE id=? AND status IN ('待发','定时待发')"
+                "UPDATE submissions SET from_mailbox=?,assigned_mailbox_id=?,"
+                "status='发送中',sent_at=?"
+                " WHERE id=? AND status IN ('待发','定时待发','等待限额','等待用户处理',"
+                "'重试等待')"
                 " AND (SELECT COUNT(*) FROM submissions"
                 " WHERE lower(from_mailbox)=lower(?)"
                 " AND status IN ('已发','发送中')"
                 " AND sent_at LIKE ?) < ?",
-                (mailbox_address, now, submission_id, mailbox_address, today,
+                (mailbox_address, mailbox_id, now, submission_id, mailbox_address, today,
                  daily_limit))
             return cur.rowcount == 1
 
@@ -765,26 +1349,27 @@ class Database:
                 sent_at = _now()
             if sent_at is not None:
                 self._conn.execute(
-                    "UPDATE submissions SET status=?, sent_at=?, last_error=? WHERE id=?",
+                    "UPDATE submissions SET status=?, sent_at=?, last_error=?,"
+                    "next_attempt_at='' WHERE id=?",
                     (status, sent_at, error or "", submission_id))
             else:
                 self._conn.execute(
-                    "UPDATE submissions SET status=?, last_error=? WHERE id=?",
+                    "UPDATE submissions SET status=?, last_error=?,next_attempt_at='' WHERE id=?",
                     (status, error or "", submission_id))
 
     def recover_stuck_sending(self, minutes: int = 30) -> int:
-        """启动/定期调用：把卡在「发送中」超过 minutes 的记录回退为待发。
-
-        崩溃后残留的「发送中」会永久占用当日额度并堵死一稿一投，
-        此方法按 sent_at 超时判定回收，返回回收条数。
-        """
-        cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+        """启动恢复：所有中断的 SMTP 单封均置为结果待确认，绝不自动重发。"""
+        _ = minutes  # 保留旧调用签名；新恢复规则不再按超时时长自动重发。
         with self._lock, self._conn:
-            cur = self._conn.execute(
-                "UPDATE submissions SET status='待发', sent_at=''"
-                " WHERE status='发送中' AND sent_at != '' AND sent_at < ?",
-                (cutoff,))
-            return cur.rowcount
+            uncertain = self._conn.execute(
+                "UPDATE submissions SET status='结果待确认', last_error='程序中断，发送结果未知'"
+                " WHERE status='发送中'")
+            self._conn.execute(
+                "UPDATE submission_batches SET status='paused',"
+                " pause_reason='存在发送结果待确认的邮件',updated_at=?"
+                " WHERE id IN (SELECT DISTINCT batch_id FROM submissions"
+                " WHERE status='结果待确认' AND batch_id IS NOT NULL)", (_now(),))
+            return uncertain.rowcount
 
     def update_reply_status(self, submission_id: int, reply_status: str):
         with self._lock, self._conn:
@@ -792,11 +1377,47 @@ class Database:
                 "UPDATE submissions SET reply_status=?, replied_at=? WHERE id=?",
                 (reply_status, _now(), submission_id))
 
-    def update_from_mailbox(self, submission_id: int, mailbox_address: str):
+    def update_from_mailbox(self, submission_id: int, mailbox_address: str,
+                            mailbox_id: str = ""):
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE submissions SET from_mailbox=? WHERE id=?",
-                (mailbox_address, submission_id))
+                "UPDATE submissions SET from_mailbox=?,assigned_mailbox_id=CASE "
+                "WHEN ?!='' THEN ? ELSE assigned_mailbox_id END WHERE id=?",
+                (mailbox_address, mailbox_id, mailbox_id, submission_id))
+
+    def update_submission_assignment(self, submission_id: int, mailbox_id: str,
+                                     queue_order: int, status: str = "待发"):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET assigned_mailbox_id=?,queue_order=?,status=?,"
+                "next_attempt_at='',sent_at='' WHERE id=?",
+                (mailbox_id, queue_order, status, submission_id))
+
+    def mark_submission_waiting(self, submission_id: int, status: str,
+                                error: str, next_attempt_at: str = ""):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET status=?,last_error=?,next_attempt_at=?,sent_at='' "
+                "WHERE id=?", (status, error, next_attempt_at, submission_id))
+
+    def mark_submission_attempt(self, submission_id: int, next_attempt_at: str = ""):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE submissions SET attempt_count=attempt_count+1,next_attempt_at=? "
+                "WHERE id=?", (next_attempt_at, submission_id))
+
+    def active_submission_exists(self, manuscript_id: int, editor_id: int,
+                                 excluding_batch_id: int | None = None) -> bool:
+        sql = ("SELECT 1 FROM submissions WHERE manuscript_id=? AND editor_id=? AND "
+               "(status IN ('待发','定时待发','发送中','等待限额','结果待确认',"
+               "'等待用户处理','重试等待') OR (status='已发' AND reply_status='无'))")
+        args: list = [manuscript_id, editor_id]
+        if excluding_batch_id is not None:
+            sql += " AND (batch_id IS NULL OR batch_id!=?)"
+            args.append(excluding_batch_id)
+        sql += " LIMIT 1"
+        with self._lock:
+            return self._conn.execute(sql, args).fetchone() is not None
 
     def delete_submission(self, submission_id: int):
         with self._lock, self._conn:
@@ -1005,6 +1626,10 @@ class Database:
                     src.backup(self._conn)
                 finally:
                     src.close()
+                # 旧版备份恢复后立即补齐当前结构；迁移设计为可重复执行。
+                with self._conn:
+                    self._conn.executescript(SCHEMA)
+                    self._migrate()
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1080,8 +1705,16 @@ class Database:
     def clear_business_data(self):
         """清空文稿、投递记录、回信、稿费 4 张业务表；保留编辑列表与设置。"""
         with self._lock, self._conn:
-            for table in ("manuscripts", "submissions", "replies", "sales"):
+            for table in ("batch_targets", "batch_manuscripts", "batch_mailbox_state",
+                          "submission_batches", "manuscripts", "submissions", "replies", "sales"):
                 self._conn.execute(f"DELETE FROM {table}")
+        # 批次附件是物化快照，也属于批次业务数据；目标固定在 files/batches 内。
+        import shutil
+        files_root = os.path.realpath(self.files_dir)
+        batch_files = os.path.realpath(os.path.join(files_root, "batches"))
+        if (os.path.commonpath((files_root, batch_files)) == files_root
+                and batch_files != files_root and os.path.isdir(batch_files)):
+            shutil.rmtree(batch_files)
 
     def list_submissions(self, status_filter: str | None = None) -> list[Submission]:
         sql = "SELECT * FROM submissions"
@@ -1099,7 +1732,8 @@ class Database:
         with self._lock:
             r = self._conn.execute(
                 "SELECT * FROM submissions WHERE manuscript_id=? AND editor_id=?"
-                " AND (status IN ('待发','定时待发','发送中')"
+                " AND (status IN ('待发','定时待发','发送中','等待限额','结果待确认',"
+                "'等待用户处理','重试等待')"
                 " OR (status='已发' AND reply_status='无'))"
                 " ORDER BY id DESC LIMIT 1",
                 (manuscript_id, editor_id)).fetchone()
